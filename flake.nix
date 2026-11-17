@@ -48,6 +48,12 @@
           pkgs.ladspa-sdk # applyplugin: reference rendering via upstream DeepFilterNet
           pkgs.pkg-config
           pkgs.pipewire # dev headers for pipewire-rs
+          pkgs.fontconfig
+          pkgs.freetype
+          pkgs.libGL
+          pkgs.wayland # libwayland-client for Slint's winit backend
+          pkgs.libxkbcommon
+          pkgs.dbus # dev headers for the D-Bus control interface
           pkgs.jq
         ];
         shellHook = ''

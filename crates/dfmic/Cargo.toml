@@ -14,3 +14,13 @@ path = "src/main.rs"
 dfn-dsp.workspace = true
 dfn-npu.workspace = true
 num-complex.workspace = true
+slint = { version = "1.19", optional = true }
+
+[build-dependencies]
+# Only used when the `gui` feature is on; it compiles ui/app.slint to Rust.
+slint-build = { version = "1.19", optional = true }
+
+[features]
+# Slint and its windowing stack are only needed for the GUI; the daemon and the
+# offline path must build without them (and do, on a headless machine).
+gui = ["dep:slint", "dep:slint-build"]

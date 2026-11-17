@@ -6,8 +6,11 @@
 //!   run      the daemon: a PipeWire virtual microphone
 //!   status   ask a running daemon what it is doing
 
+mod control;
 mod daemon;
 mod enhance;
+#[cfg(feature = "gui")]
+mod gui;
 mod pw;
 mod replay;
 mod wav;
@@ -28,6 +31,8 @@ usage:
   dfmic run     [--models DIR] [--device NPU] [--source NAME]
                 [--default-source auto|never]
   dfmic status
+  dfmic toggle            turn the filter on or off in a running daemon
+  dfmic gui               the window (needs the gui feature)
 
 environment:
   DFMIC_MODELS   directory holding enc.xml, erb_dec.xml, df_dec.xml
@@ -140,6 +145,8 @@ fn main() -> ExitCode {
         "enhance" => run_enhance(&args),
         "run" => run_daemon(&args),
         "status" => daemon::status(),
+        "toggle" => daemon::toggle(),
+        "gui" => run_gui(),
         "dump-features" => run_dump_features(&args),
         "replay-dsp" => {
             if args.positional.len() != 3 {
@@ -164,6 +171,16 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(feature = "gui")]
+fn run_gui() -> Result<(), String> {
+    gui::run()
+}
+
+#[cfg(not(feature = "gui"))]
+fn run_gui() -> Result<(), String> {
+    Err("this build has no GUI (build with --features gui)".into())
 }
 
 fn run_dump_features(args: &Args) -> Result<(), String> {

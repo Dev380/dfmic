@@ -31,6 +31,15 @@ in {
       '';
     };
 
+    gui = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Add the Slint control panel to the user's environment and a desktop
+        entry for it. The daemon itself is headless either way.
+      '';
+    };
+
     takeDefault = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -39,6 +48,9 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    # The window is a client of the daemon, so it lives in the user profile
+    # rather than in the service.
+    home.packages = lib.mkIf cfg.gui [package];
     # The daemon talks to PipeWire and to the NPU.
     users.groups.render = {};
     systemd.user.services.dfmic = {

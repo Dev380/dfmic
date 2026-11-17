@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=DeepFilter Mic
+Comment=Control the DeepFilterNet noise-suppressing virtual microphone
+Exec=dfmic gui
+Icon=dfmic
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=microphone;noise;suppression;dfn;deepfilter;
+StartupNotify=true

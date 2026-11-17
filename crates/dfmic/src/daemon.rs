@@ -11,14 +11,15 @@
 //! mid-stream it restores the previous default first.
 
 use std::path::PathBuf;
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::Command as Process;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dfn_dsp::{DfnPipeline, Params, HOP_SIZE};
 use dfn_npu::NpuRuntime;
 
+use crate::control::{Command as BusCommand, Control, Status};
 use crate::pw::{Bridge, Shared};
 
 pub const NODE_NAME: &str = "dfmic-source";
@@ -73,7 +74,7 @@ fn clear_default_backup() {
 
 /// Ask WirePlumber which source is the default, by name.
 fn current_default_source() -> Option<String> {
-    let out = Command::new("pw-metadata").arg("-n").arg("default").output().ok()?;
+    let out = Process::new("pw-metadata").arg("-n").arg("default").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         if let Some(rest) = line.split("key:'default.audio.source'").nth(1) {
@@ -88,7 +89,7 @@ fn current_default_source() -> Option<String> {
 
 fn set_default_source(name: &str) -> Result<(), String> {
     let payload = format!("{{\"name\":\"{name}\"}}");
-    let status = Command::new("pw-metadata")
+    let status = Process::new("pw-metadata")
         .args([
             "-n",
             "default",
@@ -136,7 +137,12 @@ pub fn run(opts: &Options) -> Result<(), String> {
     }
 
     let started = Instant::now();
-    let runtime = NpuRuntime::load(&opts.models, &opts.device, Some(&state_dir().join("npu-cache")))
+    // OpenVINO refuses to use a cache directory that does not exist yet, so make
+    // it first: a fresh install must work on its very first run.
+    let cache = state_dir().join("npu-cache");
+    std::fs::create_dir_all(&cache)
+        .map_err(|e| format!("cannot create {}: {e}", cache.display()))?;
+    let runtime = NpuRuntime::load(&opts.models, &opts.device, Some(&cache))
         .map_err(|e| format!("cannot use the NPU: {e}"))?;
     let mut pipeline = DfnPipeline::new(runtime, opts.params.clone());
     eprintln!(
@@ -209,14 +215,84 @@ pub fn run(opts: &Options) -> Result<(), String> {
     ];
     write_status(&base);
 
+    // The control interface: the GUI and `dfmic toggle` drive the daemon here.
+    let (tx, rx) = std::sync::mpsc::channel::<BusCommand>();
+    let control = match Control::start(&opts.device, &capture_target, tx) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            // Without D-Bus the microphone still works; say so and carry on.
+            eprintln!("dfmic: warning: control interface unavailable: {e}");
+            None
+        }
+    };
+    let enabled = Arc::new(AtomicBool::new(true));
+    // Live parameters travel as raw f32 bits so the audio thread never takes a
+    // lock: the GUI writes, the worker applies at the top of each block.
+    let live = Arc::new(LiveParams::new(&opts.params));
+    control.as_ref().map(|c| {
+        c.update(&Status {
+            enabled: true,
+            ..Default::default()
+        })
+    });
+
     let worker = {
         let shared = Arc::clone(&shared);
-        std::thread::spawn(move || worker_loop(&mut pipeline, shared, base))
+        let enabled = Arc::clone(&enabled);
+        let live = Arc::clone(&live);
+        let params_base = opts.params.clone();
+        std::thread::spawn(move || {
+            worker_loop(&mut pipeline, shared, base, enabled, live, params_base)
+        })
     };
 
-    // Run until told to stop, or until PipeWire reports a failure.
+    // Run until told to stop, until PipeWire reports a failure, or until the bus
+    // asks us to quit.
+    let mut last_in = 0.0f64;
+    let mut last_out = 0.0f64;
     while !STOP.load(Ordering::SeqCst) && !shared.failed.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(50));
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(BusCommand::Toggle) => {
+                let now = !enabled.load(Ordering::SeqCst);
+                enabled.store(now, Ordering::SeqCst);
+                if std::env::var("DFMIC_DEBUG").is_ok() {
+                    eprintln!("dfmic: toggle -> {now}");
+                }
+            }
+            Ok(BusCommand::Enable) => enabled.store(true, Ordering::SeqCst),
+            Ok(BusCommand::Disable) => enabled.store(false, Ordering::SeqCst),
+            Ok(BusCommand::SetParam(name, value)) => match name.as_str() {
+                "atten-lim" => live.atten_lim.store((value as f32).to_bits(), Ordering::Relaxed),
+                "post-filter" => {
+                    live.post_filter.store((value as f32).to_bits(), Ordering::Relaxed)
+                }
+                _ => eprintln!("dfmic: ignoring unknown parameter {name:?}"),
+            },
+            Ok(BusCommand::Shutdown) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+
+        if let Some(control) = control.as_ref() {
+            // Peak decay: jump up instantly, fall smoothly, like a real meter.
+            let in_peak = shared.peak.swap(0, Ordering::Relaxed) as f64 / 1e6;
+            last_in = if in_peak > last_in { in_peak } else { last_in * 0.85 };
+            let out_peak = shared.output_peak.swap(0, Ordering::Relaxed) as f64 / 1e6;
+            last_out = if out_peak > last_out { out_peak } else { last_out * 0.85 };
+            control.update(&Status {
+                enabled: enabled.load(Ordering::SeqCst),
+                atten_lim: live.atten_lim() as f64,
+                post_filter: live.post_filter() as f64,
+                level: last_in,
+                out_level: last_out,
+                latency_ms: 10.0,
+                inferences: shared.played.load(Ordering::Relaxed) as u32 / HOP_SIZE as u32,
+                dropped: shared.dropped.load(Ordering::Relaxed) as u32 / HOP_SIZE as u32,
+                error: String::new(),
+            });
+            control.set_params(live.atten_lim() as f64, live.post_filter() as f64);
+            control.notify_changed();
+        }
     }
 
     let failure = shared.failed.load(Ordering::SeqCst).then(|| {
@@ -249,19 +325,45 @@ pub fn run(opts: &Options) -> Result<(), String> {
     }
 }
 
+/// Parameters the GUI can change while the audio thread runs.
+struct LiveParams {
+    atten_lim: AtomicU32,
+    post_filter: AtomicU32,
+}
+
+impl LiveParams {
+    fn new(params: &Params) -> Self {
+        Self {
+            atten_lim: AtomicU32::new(params.atten_lim_db.to_bits()),
+            post_filter: AtomicU32::new(params.post_filter_beta.to_bits()),
+        }
+    }
+
+    fn atten_lim(&self) -> f32 {
+        f32::from_bits(self.atten_lim.load(Ordering::Relaxed))
+    }
+
+    fn post_filter(&self) -> f32 {
+        f32::from_bits(self.post_filter.load(Ordering::Relaxed))
+    }
+}
+
 fn worker_loop(
     pipeline: &mut DfnPipeline<NpuRuntime>,
     shared: Arc<Shared>,
     base: Vec<(&'static str, String)>,
+    enabled: Arc<AtomicBool>,
+    live: Arc<LiveParams>,
+    params_base: Params,
 ) {
     let mut block = vec![0.0f32; HOP_SIZE];
     let mut enhanced = vec![0.0f32; HOP_SIZE];
     let mut last_status = Instant::now();
 
     while !STOP.load(Ordering::SeqCst) && !shared.failed.load(Ordering::SeqCst) {
-        // Nothing is recording from us: drop the audio and leave the NPU idle
-        // rather than filtering into a void.
-        if !shared.consumers.load(Ordering::SeqCst) {
+        // Disabled, or nothing is recording from us: drop the audio and leave the
+        // NPU idle rather than filtering into a void.
+        if !enabled.load(Ordering::SeqCst) || !shared.consumers.load(Ordering::SeqCst) {
             let mut sink = vec![0.0f32; 4096];
             while shared.input.pop(&mut sink) > 0 {}
             std::thread::sleep(Duration::from_millis(20));
@@ -274,6 +376,12 @@ fn worker_loop(
         if shared.input.pop(&mut block) < HOP_SIZE {
             continue;
         }
+        // Apply any live parameter changes before filtering this block.
+        let mut params = params_base.clone();
+        params.atten_lim_db = live.atten_lim();
+        params.post_filter_beta = live.post_filter();
+        *pipeline.params_mut() = params;
+
         pipeline.process(&block, &mut enhanced);
         if !shared.output.push(&enhanced) {
             shared.dropped.fetch_add(HOP_SIZE as u64, Ordering::Relaxed);
@@ -293,6 +401,31 @@ fn worker_loop(
             write_status(&fields);
         }
     }
+}
+
+/// Toggle the filter in a running daemon, from the command line (keybinds,
+/// notification buttons, scripts).
+pub fn toggle() -> Result<(), String> {
+    let out = Process::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.dfmic.Control",
+            "--object-path",
+            "/org/dfmic/Control",
+            "--method",
+            "org.dfmic.Control.Toggle",
+        ])
+        .output()
+        .map_err(|e| format!("running gdbus: {e}"))?;
+    if !out.status.success() {
+        return Err("no daemon is listening on org.dfmic.Control".into());
+    }
+    let state = String::from_utf8_lossy(&out.stdout);
+    let on = state.contains("true");
+    println!("{}", if on { "on" } else { "off" });
+    Ok(())
 }
 
 pub fn status() -> Result<(), String> {

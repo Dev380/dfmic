@@ -55,6 +55,8 @@ pub struct Shared {
     pub dropped: AtomicU64,
     /// Peak absolute sample captured, in units of 1e-6, for level reporting.
     pub peak: AtomicU64,
+    /// Peak absolute sample emitted to apps, in units of 1e-6.
+    pub output_peak: AtomicU64,
     /// Whether anything is recording from our node.
     pub consumers: AtomicBool,
 }
@@ -70,6 +72,7 @@ impl Shared {
             played: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             peak: AtomicU64::new(0),
+            output_peak: AtomicU64::new(0),
             consumers: AtomicBool::new(false),
         })
     }
@@ -103,6 +106,11 @@ extern "C" fn on_playback(samples: *mut f32, frames: u32, user: *mut c_void) {
     let data = unsafe { std::slice::from_raw_parts_mut(samples, frames as usize) };
     let got = shared.output.pop(data);
     shared.played.fetch_add(got as u64, Ordering::Relaxed);
+    let peak = data.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let scaled = (peak * 1e6) as u64;
+    if scaled > shared.output_peak.load(Ordering::Relaxed) {
+        shared.output_peak.store(scaled, Ordering::Relaxed);
+    }
 }
 
 extern "C" fn on_source_started(user: *mut c_void) {

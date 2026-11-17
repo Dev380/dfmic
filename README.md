@@ -103,11 +103,37 @@ shapes, the window length and each state tensor (name, shape, output index).
 - **Vendored DSP.** Stage 2 vendors `DFState` from `libDF` (MIT/Apache-2.0,
   credited) rather than forking the whole training repo.
 
+## The control panel
+
+`dfmic gui` opens a Slint window that is a remote control and a meter for the
+daemon; the audio engine stays in the service. Everything it shows comes from
+`org.dfmic.Control` on the session bus, and every control is a method call, so
+the same interface drives keybinds:
+
+```
+dfmic toggle                  # flips the filter, prints on/off
+gdbus call --session --dest org.dfmic.Control --object-path /org/dfmic/Control \
+  --method org.dfmic.Control.SetParam 'atten-lim' 60.0
+```
+
+The window shows the state in one glance (Filtering/Off), a real dBFS meter for
+the microphone and for what apps receive, the device in use, latency and drop
+counters, and an Advanced section with the two knobs that are worth touching —
+each labelled with what it does. Expert parameters apply live: the daemon reads
+them from atomics at the top of every block, so nothing on the audio path takes
+a lock.
+
+Meters are measured, not decorative: the daemon tracks the peak of the samples
+it captures and of the samples it hands to the source node, and the GUI maps
+those to a −60..0 dBFS scale.
+
 ## Not done yet
 
-- **GUI** (stage 3): Slint window over D-Bus, the full knob set, soft mode,
-  self-monitor, AGC.
+- **Soft mode** ("keep music/room") and **self-monitor** as one-click presets in
+  the GUI; today the equivalent is moving the attenuation slider.
 - **AGC** (automatic gain), which the model can leave quieter than the raw mic.
+- **Device picker** in the GUI: `SetSource` is accepted but changing the capture
+  device needs a stream restart, which the daemon does not do yet.
 - **Sample-exact parity** with upstream (see above; needs per-layer conv state).
 
 ## Roadmap
@@ -127,7 +153,7 @@ shapes, the window length and each state tensor (name, shape, output index).
 Code here is MIT/Apache-2.0. DeepFilterNet and its model weights are by Hendrik
 Schröter et al., MIT/Apache-2.0 — see `NOTICE`.
 
-## Status: stage 2 complete
+## Status: stage 3 complete (GUI)
 
 The daemon, the PipeWire node and the systemd integration work. Verified on this
 machine (Core Ultra 9 285H, Intel AI Boost NPU, PipeWire 1.6.11 + WirePlumber):
