@@ -26,7 +26,7 @@ usage:
                 [--atten-lim DB] [--post-filter BETA]
                 [--min-thresh DB] [--max-erb-thresh DB] [--max-df-thresh DB]
   dfmic run     [--models DIR] [--device NPU] [--source NAME]
-                [--default-source auto|never] [--no-self-monitor]
+                [--default-source auto|never]
   dfmic status
 
 environment:
@@ -46,7 +46,7 @@ fn parse_args() -> Result<Args, String> {
     let mut flags = Vec::new();
     while let Some(arg) = argv.next() {
         if let Some(name) = arg.strip_prefix("--") {
-            if name == "no-self-monitor" || name == "help" {
+            if name == "help" {
                 flags.push((name.to_string(), String::new()));
             } else {
                 let value = argv.next().ok_or_else(|| format!("--{name} needs a value"))?;
@@ -181,7 +181,6 @@ fn run_daemon(args: &Args) -> Result<(), String> {
         device: args.device(),
         source: args.flag("source").map(str::to_string),
         take_default: args.flag("default-source").unwrap_or("auto") == "auto",
-        self_monitor: !args.has("no-self-monitor"),
         params: params_from(args)?,
     })
 }

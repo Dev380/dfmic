@@ -103,6 +103,13 @@ shapes, the window length and each state tensor (name, shape, output index).
 - **Vendored DSP.** Stage 2 vendors `DFState` from `libDF` (MIT/Apache-2.0,
   credited) rather than forking the whole training repo.
 
+## Not done yet
+
+- **GUI** (stage 3): Slint window over D-Bus, the full knob set, soft mode,
+  self-monitor, AGC.
+- **AGC** (automatic gain), which the model can leave quieter than the raw mic.
+- **Sample-exact parity** with upstream (see above; needs per-layer conv state).
+
 ## Roadmap
 
 1. **Model + parity (done, except real-audio gate)** — remaining: a numpy port
@@ -148,7 +155,9 @@ What the daemon does:
 - takes over the default source while running and restores it on exit, including
   after `SIGKILL` (the previous default is written to
   `$XDG_RUNTIME_DIR/dfmic/previous-default` and restored on the next start),
-- writes `$XDG_RUNTIME_DIR/dfmic/status` with live counters for `dfmic status`.
+- writes `$XDG_RUNTIME_DIR/dfmic/status` with live counters for `dfmic status`,
+- and **idles the NPU when nothing is recording** from the node: on a laptop that
+  is the difference between filtering into the void and actually saving power.
 
 ### Two bugs worth remembering
 

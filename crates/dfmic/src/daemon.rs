@@ -42,7 +42,6 @@ pub struct Options {
     pub device: String,
     pub source: Option<String>,
     pub take_default: bool,
-    pub self_monitor: bool,
     pub params: Params,
 }
 
