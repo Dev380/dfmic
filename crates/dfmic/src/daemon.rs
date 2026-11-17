@@ -122,8 +122,9 @@ fn clear_status() {
 
 pub fn run(opts: &Options) -> Result<(), String> {
     unsafe {
-        signal(SIGINT, on_signal as usize);
-        signal(SIGTERM, on_signal as usize);
+        let handler = on_signal as extern "C" fn(i32) as usize;
+        signal(SIGINT, handler);
+        signal(SIGTERM, handler);
     }
 
     // A previous run that died without cleaning up leaves a stale backup; put it
