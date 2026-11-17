@@ -119,3 +119,115 @@ shapes, the window length and each state tensor (name, shape, output index).
 
 Code here is MIT/Apache-2.0. DeepFilterNet and its model weights are by Hendrik
 Schröter et al., MIT/Apache-2.0 — see `NOTICE`.
+
+## Status: stage 2 complete
+
+The daemon, the PipeWire node and the systemd integration work. Verified on this
+machine (Core Ultra 9 285H, Intel AI Boost NPU, PipeWire 1.6.11 + WirePlumber):
+
+```
+dfmic doctor
+  openvino devices: ["CPU", "GPU", "NPU"]
+  compiled on NPU in 0.07 s
+  steady state: 1.9 ms per 10 ms frame (5.2x realtime, 10% duty)
+
+dfmic run
+  dfmic: capturing from alsa_input...HiFi__Mic1__source
+  dfmic: 'DeepFilter Mic' is now the default source
+  ... recordings from dfmic-source: rms 0.0038, peak 0.025, 0 dropped frames
+  ... on exit: restored default source to alsa_input...HiFi__Mic1__source
+```
+
+What the daemon does:
+
+- captures the physical microphone on a PipeWire input stream pinned to an
+  explicit device (never "follow the default", see below),
+- exports an `Audio/Source` node called `DeepFilter Mic`,
+- runs the NPU on a worker thread between two lock-free rings, so the realtime
+  callbacks never block,
+- takes over the default source while running and restores it on exit, including
+  after `SIGKILL` (the previous default is written to
+  `$XDG_RUNTIME_DIR/dfmic/previous-default` and restored on the next start),
+- writes `$XDG_RUNTIME_DIR/dfmic/status` with live counters for `dfmic status`.
+
+### Two bugs worth remembering
+
+Both were found by testing against the real system rather than in isolation:
+
+1. **Self-capture.** The capture stream first followed the *default* source.
+   Taking over the default then made it capture our own output: silence, zero
+   inferences, no error. The capture target is now resolved *before* the takeover
+   and pinned with `node.dont-reconnect`.
+2. **Missing autoconnect.** Without `PW_STREAM_FLAG_AUTOCONNECT` WirePlumber
+   never linked the capture stream to the microphone, so the node sat in
+   `suspended` and produced silence.
+
+## Honest note on parity with upstream
+
+The DSP is exact: replaying libDF's own gains/coefficients through `dfn-dsp`
+(`dfmic replay-dsp`) reproduces upstream's audio at **51 dB SDR**, and the
+converted graphs match the upstream ONNX graphs to ~1e-3 when given the same
+recurrent state.
+
+End-to-end, however, our output is *not* sample-identical to upstream
+`deep-filter`. The reason is the recurrent state: upstream (tract's `pulse`)
+keeps per-layer convolution state, while we run a sliding window and can only
+keep the GRU state. At the start of a stream the two therefore diverge, and
+DFN3's encoder GRU has long enough memory that the difference never fully decays.
+
+Measured consequence: on speech-like audio with a known clean reference, upstream
+and dfmic behave the same (output rms 0.0139 vs 0.0142, same suppression), but the
+waveforms differ. Making it sample-exact would mean exposing per-layer conv state
+in the IR, which is a larger change than it is worth for a live microphone.
+
+## Usage
+
+```sh
+# check the NPU and the models
+dfmic doctor
+
+# clean a file offline
+dfmic enhance in.wav out.wav [--atten-lim 100] [--post-filter 0.02]
+
+# the virtual microphone (becomes the default source, restores on exit)
+dfmic run [--source <node name>] [--default-source never]
+
+# what is it doing?
+dfmic status
+```
+
+### NixOS
+
+```nix
+{
+  inputs.dfmic.url = "path:~/Code/dfmic"; # or git+...
+  # ...
+  imports = [inputs.dfmic.nixosModules.default];
+  services.dfmic = {
+    enable = true;
+    # source = "alsa_input...HiFi__Mic1__source"; # pin the microphone
+  };
+}
+```
+
+The module installs a systemd *user* service that restarts on failure with a
+backoff; the daemon restores the previous default source before exiting, so a
+crash never leaves the system without a microphone.
+
+## Development
+
+```sh
+nix develop
+cargo test                 # DSP unit tests (STFT round trip, ERB bank, ...)
+nix build .#dfmic          # the daemon
+nix build .#models         # converted NPU artifacts
+nix flake check            # conversion parity gate
+```
+
+Diagnostics that paid for themselves:
+
+- `dfmic dump-features file.wav [--models DIR]` — DSP features, and the encoder's
+  per-frame outputs, for comparison against `libDF/examples/dump_features.rs`.
+- `DFMIC_DUMP=1 dfmic enhance ...` — per-frame gains/coefficients in the same
+  format as libDF's `DF_DUMP`, feedable to `dfmic replay-dsp`.
+- `DFMIC_DEBUG=1 dfmic run` — PipeWire stream state transitions.

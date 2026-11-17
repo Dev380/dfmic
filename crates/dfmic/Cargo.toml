@@ -1,0 +1,16 @@
+[package]
+name = "dfmic"
+description = "DeepFilterNet3_ll virtual microphone on the Intel NPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dfmic"
+path = "src/main.rs"
+
+[dependencies]
+dfn-dsp.workspace = true
+dfn-npu.workspace = true
+num-complex.workspace = true

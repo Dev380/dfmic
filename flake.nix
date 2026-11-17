@@ -9,6 +9,7 @@
     self,
     nixpkgs,
   }: let
+    lib = nixpkgs.lib;
     systems = ["x86_64-linux"];
     eachSystem = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
@@ -22,18 +23,17 @@
         ps.scipy
       ]);
   in {
-    packages = eachSystem (pkgs: let
+    packages = eachSystem (pkgs: rec {
       python = mkPython pkgs;
       upstreamModel = pkgs.fetchurl {
         url = "https://github.com/Rikorose/DeepFilterNet/raw/v0.5.6/models/DeepFilterNet3_ll_onnx.tar.gz";
         sha256 = "0fnga4r1wd1g4ahx90pj3rbml1ps9aw9gvw6d6vrpq50if7fb62r";
       };
-    in {
       # The converted, stateful, static-shape NPU artifacts. Everything else
       # (engine, GUI) consumes this; nothing at runtime touches ONNX.
       models = pkgs.callPackage ./nix/models.nix {inherit python upstreamModel;};
-      inherit python upstreamModel;
-      default = self.packages.${pkgs.system}.models;
+      dfmic = pkgs.callPackage ./nix/package.nix {dfmic-models = models;};
+      default = self.packages.${pkgs.system}.dfmic;
     });
 
     devShells = eachSystem (pkgs: {
@@ -46,10 +46,14 @@
           pkgs.clippy
           pkgs.ffmpeg
           pkgs.ladspa-sdk # applyplugin: reference rendering via upstream DeepFilterNet
+          pkgs.pkg-config
+          pkgs.pipewire # dev headers for pipewire-rs
           pkgs.jq
         ];
         shellHook = ''
           export DFMIC_MODELS=${self.packages.${pkgs.system}.models}
+          # Hand-written PipeWire FFI: the linker needs the .so symlink.
+          export RUSTFLAGS="-L native=${pkgs.pipewire.dev}/lib -L native=${pkgs.openvino.lib}/lib"
           echo "dfmic: model artifacts at $DFMIC_MODELS"
         '';
       };
@@ -71,6 +75,11 @@
             --device CPU --frames 60 --settle 10 | tee $out
         '';
     });
+
+    nixosModules.default = {
+      imports = [./nix/module.nix];
+      services.dfmic.package = lib.mkDefault self.packages.${nixpkgs.lib.system}.dfmic;
+    };
 
     formatter = eachSystem (pkgs: pkgs.alejandra);
   };

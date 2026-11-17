@@ -1,0 +1,13 @@
+[package]
+name = "dfn-npu"
+description = "DeepFilterNet3_ll inference on the Intel NPU via OpenVINO's C API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dfn-dsp.workspace = true
+num-complex.workspace = true
+
+[build]

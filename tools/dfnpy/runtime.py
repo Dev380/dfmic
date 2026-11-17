@@ -69,6 +69,18 @@ class Graph:
         self.state_frames = self.frames - 1  # h history length per GRU
         self.next_frame = 0
 
+    def prime(self, **frame: np.ndarray) -> None:
+        """Pre-fill the input window with a frame, without running the graph.
+
+        Used to start a stream from "silence so far": the window must be full
+        before the convolutions produce a valid frame, and padding it with zeros
+        is wrong because zero is far outside the feature distribution (a silent
+        frame has `feat_erb` around -1, not 0).
+        """
+        for name, value in frame.items():
+            for _ in range(self.frames):
+                self.history[name].append(np.ascontiguousarray(value, np.float32))
+
     def push(self, **frame: np.ndarray) -> dict[str, np.ndarray] | None:
         """Feed one frame; returns that frame's outputs.
 

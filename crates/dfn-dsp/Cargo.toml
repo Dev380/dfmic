@@ -1,0 +1,11 @@
+[package]
+name = "dfn-dsp"
+description = "DeepFilterNet signal processing, vendored from libDF"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+num-complex.workspace = true
+realfft.workspace = true
