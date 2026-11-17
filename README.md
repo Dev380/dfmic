@@ -40,10 +40,10 @@ Measured cost of that choice, driving the real graphs on the NPU, 48 kHz mono,
 
 | metric | value |
 |---|---|
-| mean per 10 ms frame | **1.13 ms** |
-| p99 / max | 1.72 ms / 1.82 ms |
-| NPU duty cycle | **11%** |
-| realtime factor | 8.8× |
+| mean per 10 ms frame | **0.96 – 1.13 ms** |
+| p99 / max | 1.30 – 1.72 ms |
+| NPU duty cycle | **10–11%** |
+| realtime factor | 8.8 – 10.4× |
 | host CPU (Python runtime) | 0.38 ms/frame |
 
 For reference, the same weights on the CPU via tract (nixpkgs `deepfilternet`
