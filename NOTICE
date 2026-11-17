@@ -1,0 +1,4 @@
+dfmic vendors and adapts work from DeepFilterNet
+(https://github.com/Rikorose/DeepFilterNet), Copyright (c) Hendrik Schröter,
+licensed under MIT / Apache-2.0. The model weights converted by this project
+(DeepFilterNet3_ll) are part of that upstream release and keep their licence.
