@@ -259,6 +259,14 @@ fn worker_loop(
     let mut last_status = Instant::now();
 
     while !STOP.load(Ordering::SeqCst) && !shared.failed.load(Ordering::SeqCst) {
+        // Nothing is recording from us: drop the audio and leave the NPU idle
+        // rather than filtering into a void.
+        if !shared.consumers.load(Ordering::SeqCst) {
+            let mut sink = vec![0.0f32; 4096];
+            while shared.input.pop(&mut sink) > 0 {}
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         if shared.input.len() < HOP_SIZE {
             std::thread::sleep(Duration::from_millis(1));
             continue;

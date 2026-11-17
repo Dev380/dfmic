@@ -29,6 +29,7 @@ typedef void (*dfmic_capture_cb)(const float *samples, unsigned frames, void *us
 typedef void (*dfmic_playback_cb)(float *samples, unsigned frames, void *user);
 typedef void (*dfmic_state_cb)(int error, const char *message, void *user);
 typedef void (*dfmic_source_started_cb)(void *user);
+typedef void (*dfmic_source_stopped_cb)(void *user);
 
 struct dfmic_pw {
   struct pw_thread_loop *loop;
@@ -43,6 +44,7 @@ struct dfmic_pw {
   dfmic_playback_cb on_playback;
   dfmic_state_cb on_state;
   dfmic_source_started_cb on_source_started;
+  dfmic_source_stopped_cb on_source_stopped;
   void *user;
   int capture_ready;
   int playback_ready;
@@ -119,6 +121,10 @@ static void playback_state_changed(void *data, enum pw_stream_state old,
   /* A consumer just attached: anything buffered so far is stale. */
   if (state == PW_STREAM_STATE_STREAMING && pw->on_source_started != NULL)
     pw->on_source_started(pw->user);
+  /* No consumer any more: stop burning the NPU. */
+  if (state != PW_STREAM_STATE_STREAMING && old == PW_STREAM_STATE_STREAMING &&
+      pw->on_source_stopped != NULL)
+    pw->on_source_stopped(pw->user);
 }
 
 static void core_error(void *data, uint32_t id, int seq, int res, const char *message) {
@@ -149,7 +155,8 @@ static const struct pw_stream_events playback_events = {
 struct dfmic_pw *dfmic_pw_start(const char *node_name, const char *node_description,
                                 const char *target_source, dfmic_capture_cb on_capture,
                                 dfmic_playback_cb on_playback, dfmic_state_cb on_state,
-                                dfmic_source_started_cb on_source_started, void *user,
+                                dfmic_source_started_cb on_source_started,
+                                dfmic_source_stopped_cb on_source_stopped, void *user,
                                 char *err, size_t err_len) {
   static int initialised = 0;
   if (!initialised) {
@@ -166,6 +173,7 @@ struct dfmic_pw *dfmic_pw_start(const char *node_name, const char *node_descript
   pw->on_playback = on_playback;
   pw->on_state = on_state;
   pw->on_source_started = on_source_started;
+  pw->on_source_stopped = on_source_stopped;
   pw->user = user;
 
   pw->loop = pw_thread_loop_new("dfmic", NULL);

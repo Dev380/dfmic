@@ -16,6 +16,7 @@ type CaptureCb = extern "C" fn(*const f32, u32, *mut c_void);
 type PlaybackCb = extern "C" fn(*mut f32, u32, *mut c_void);
 type StateCb = extern "C" fn(c_int, *const c_char, *mut c_void);
 type SourceStartedCb = extern "C" fn(*mut c_void);
+type SourceStoppedCb = extern "C" fn(*mut c_void);
 
 #[link(name = "dfmic_pw")]
 extern "C" {
@@ -27,6 +28,7 @@ extern "C" {
         on_playback: PlaybackCb,
         on_state: StateCb,
         on_source_started: SourceStartedCb,
+        on_source_stopped: SourceStoppedCb,
         user: *mut c_void,
         err: *mut c_char,
         err_len: usize,
@@ -53,6 +55,8 @@ pub struct Shared {
     pub dropped: AtomicU64,
     /// Peak absolute sample captured, in units of 1e-6, for level reporting.
     pub peak: AtomicU64,
+    /// Whether anything is recording from our node.
+    pub consumers: AtomicBool,
 }
 
 impl Shared {
@@ -66,6 +70,7 @@ impl Shared {
             played: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             peak: AtomicU64::new(0),
+            consumers: AtomicBool::new(false),
         })
     }
 
@@ -104,6 +109,12 @@ extern "C" fn on_source_started(user: *mut c_void) {
     let shared = unsafe { &*(user as *const Shared) };
     // Drop whatever was captured while nobody was listening.
     shared.output.clear();
+    shared.consumers.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn on_source_stopped(user: *mut c_void) {
+    let shared = unsafe { &*(user as *const Shared) };
+    shared.consumers.store(false, Ordering::SeqCst);
 }
 
 extern "C" fn on_state(error: c_int, message: *const c_char, user: *mut c_void) {
@@ -145,6 +156,7 @@ impl Bridge {
                 on_playback,
                 on_state,
                 on_source_started,
+                on_source_stopped,
                 user,
                 err.as_mut_ptr() as *mut c_char,
                 err.len(),
