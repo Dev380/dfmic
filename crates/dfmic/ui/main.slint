@@ -1,0 +1,1146 @@
+// DeepFilter Mic — the control window.
+//
+// Everything shown here comes from the daemon through the `Ui` global, which the
+// Rust side fills from D-Bus. The window keeps no state of its own beyond what
+// is open and closed; actions go out through the callbacks and come back as
+// confirmed state.
+
+import { ScrollView } from "std-widgets.slint";
+import { Theme, Mood } from "theme.slint";
+import { Icon, IconKind } from "icons.slint";
+import { Button, ButtonKind, Switch, SwitchRow, Segmented, ParamSlider, Banner, Tone, Badge, Section, Divider, Disclosure, FocusRing, Focusable } from "controls.slint";
+import { Meter, MeterStatus } from "meter.slint";
+
+export { Mood, IconKind, MeterStatus }
+
+export struct DeviceRow {
+    name: string,
+    description: string,
+    kind: string,          // "USB", "Bluetooth headset", "Built-in"...
+    icon: IconKind,
+    caution: string,       // e.g. "Call-quality audio while in use"
+    selected: bool,
+    system-default: bool,
+    is-virtual: bool,
+}
+
+export struct ParamSpec {
+    key: string,
+    minimum: float,
+    maximum: float,
+    step: float,
+    default-value: float,
+}
+
+export struct LatencyPart {
+    label: string,
+    value: string,
+    explain: string,
+}
+
+export struct MeterView {
+    status: MeterStatus,
+    rms-db: float,
+    peak-db: float,
+    hold-db: float,
+    readout: string,
+    clip: bool,
+}
+
+export global Ui {
+    // Connection and the tile at the top.
+    in property <bool> live;              // the daemon answers on the bus
+    in property <Mood> mood: Mood.busy;
+    in property <string> headline: "Connecting…";
+    in property <string> explain;
+    in property <bool> switch-on;
+    in property <bool> switch-pending;    // optimistic, not yet confirmed
+    in property <bool> can-start;         // daemon down, unit installed
+    in property <bool> starting;          // a start request is in flight
+    in property <string> start-label: "Start DeepFilter Mic";
+    in property <string> no-service-hint;
+
+    // Quick facts on the tile.
+    in property <string> device-chip;
+    in property <IconKind> device-icon: IconKind.mic;
+    in property <string> latency-chip;
+    in property <string> drops-chip;
+    in property <bool> drops-bad;
+    in property <string> npu-chip;
+    in property <bool> npu-bad;
+
+    // Levels.
+    in property <MeterView> input: { status: MeterStatus.unavailable, rms-db: -100, peak-db: -100, hold-db: -100, readout: "—" };
+    in property <MeterView> output: { status: MeterStatus.unavailable, rms-db: -100, peak-db: -100, hold-db: -100, readout: "—" };
+    in property <string> input-note;
+    in property <string> output-note;
+    in property <string> agc-readout;     // "+6.0 dB"
+    in property <bool> agc-active;
+    in property <bool> voice;
+
+    // Devices.
+    in property <[DeviceRow]> devices;
+    in property <string> source-name;
+    in property <string> source-description;
+    in property <bool> source-missing;
+
+    // Sound.
+    in property <bool> soft;
+    in property <string> soft-summary;    // which parameters soft mode sets
+    in property <bool> agc;
+    in property <bool> graph-quantum;    // ask for a shorter PipeWire quantum
+    in property <bool> monitor;
+    in property <string> monitor-target;
+    in property <bool> recording;          // a take is being captured
+    in property <bool> has-recording;      // there is a take to play
+    in property <string> playing;          // "", "raw" or "filtered"
+    in property <string> playing-label;    // what is playing, for the badge
+    in property <bool> monitor-headphones;
+    in property <bool> monitor-speakers;
+
+    // Tuning: same order as `PARAMS` in proto.rs.
+    in property <[ParamSpec]> specs;
+    in property <[float]> values;
+    in property <[bool]> locked;          // overridden by soft mode
+    in property <bool> params-at-default: true;
+
+    // Diagnostics.
+    in property <string> latency-total;
+    in property <[LatencyPart]> latency-parts;
+    in property <string> compute-device;
+    in property <string> inference-text;
+    in property <string> overruns-text;
+    in property <string> underruns-text;
+    in property <string> inferences-text;
+
+    // System.
+    in property <bool> take-default;
+    in property <bool> is-default;
+    in property <string> default-detail;
+    in property <bool> autostart;
+    in property <bool> autostart-known;
+    in property <bool> notify;
+
+    // Messages.
+    in property <int> notices-count;
+    in property <string> notices-text;
+    in property <string> failure-title;
+    in property <string> failure-body;
+    in property <string> toast;
+    in property <string> toast-action;
+
+    callback toggle();
+    callback start-service();
+    callback set-param(int, float);
+    callback reset-param(int);
+    callback reset-params();
+    callback set-soft(bool);
+    callback set-source(string);
+    callback set-agc(bool);
+    callback set-graph-quantum(bool);
+    callback set-monitor(bool);
+    callback set-take-default(bool);
+    callback set-autostart(bool);
+    callback set-notify(bool);
+    callback reset-all();
+    callback dismiss-notices();
+    callback clear-failure();
+    callback copied();
+    callback reset-clip(bool /* output */);
+    // Record raw and filtered audio, then play the take back.
+    callback toggle-recording();
+    callback play-take(string /* raw, filtered */);
+    callback toast-activate();
+    callback toast-dismiss();
+}
+
+component Body inherits Text {
+    color: Theme.text;
+    font-family: Theme.family;
+    font-size: Theme.size-body;
+    wrap: word-wrap;
+}
+
+component Small inherits Text {
+    color: Theme.muted;
+    font-family: Theme.family;
+    font-size: Theme.size-small;
+    wrap: word-wrap;
+}
+
+// One fact on the tile: icon + short text, coloured for the tile it sits on.
+component TileFact {
+    in property <IconKind> icon;
+    in property <string> text;
+    in property <color> ink;
+    in property <bool> alarm;
+    in property <string> label;
+    accessible-role: AccessibleRole.text;
+    accessible-label: label + ": " + text;
+    horizontal-stretch: 0;
+    min-width: l.min-width;
+    l := HorizontalLayout {
+        spacing: 6px;
+        Icon {
+            y: (parent.height - self.height) / 2;
+            kind: alarm ? IconKind.warning : icon;
+            color: ink;
+            size: 16px;
+        }
+        Text {
+            text: root.text;
+            color: ink;
+            font-family: Theme.family;
+            font-size: Theme.size-small;
+            font-weight: alarm ? Theme.semibold : Theme.medium;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+// The tile: the state of the filter, readable from across the room, plus the
+// one control that matters most.
+component Hero inherits Rectangle {
+    property <color> ink: Theme.mood-text(Ui.mood);
+    property <color> sub: Theme.mood-sub(Ui.mood);
+    property <IconKind> glyph: Ui.mood == Mood.filtering ? IconKind.waveform
+        : Ui.mood == Mood.ready ? IconKind.check
+        : Ui.mood == Mood.off ? IconKind.power
+        : Ui.mood == Mood.warning ? IconKind.warning
+        : Ui.mood == Mood.failed ? IconKind.cross
+        : Ui.mood == Mood.absent ? IconKind.plug
+        : IconKind.info;
+
+    background: Theme.mood-fill(Ui.mood);
+    vertical-stretch: 0;
+    border-radius: Theme.radius + 4px;
+    animate background { duration: 300ms; easing: ease-out-quart; }
+    accessible-role: groupbox;
+    accessible-label: Ui.headline;
+    accessible-description: Ui.explain;
+
+    VerticalLayout {
+        padding: 20px;
+        padding-bottom: 16px;
+        spacing: 14px;
+
+        HorizontalLayout {
+            spacing: 16px;
+            // The glyph sits in a disc so its shape carries the state on its own.
+            VerticalLayout {
+                alignment: start;
+                Rectangle {
+                    width: 52px;
+                    height: 52px;
+                    border-radius: 26px;
+                    background: ink.with-alpha(0.14);
+                    Icon {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        kind: glyph;
+                        color: ink;
+                        size: 28px;
+                    }
+                }
+            }
+            VerticalLayout {
+                spacing: 4px;
+                alignment: center;
+                horizontal-stretch: 1;
+                Text {
+                    text: Ui.headline;
+                    color: ink;
+                    font-family: Theme.family;
+                    font-size: Theme.size-hero;
+                    font-weight: Theme.semibold;
+                    letter-spacing: -0.4px;
+                    overflow: elide;
+                }
+                Text {
+                    text: Ui.explain;
+                    color: sub;
+                    font-family: Theme.family;
+                    font-size: Theme.size-body;
+                    wrap: word-wrap;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                if Ui.live: Switch {
+                    large: true;
+                    checked: Ui.switch-on;
+                    label: "Noise suppression";
+                    // A light track on the coloured tile: the switch must read
+                    // at a glance, not blend into the tile behind it.
+                    on-color: ink.with-alpha(0.92);
+                    off-color: ink.with-alpha(0.28);
+                    knob-color: Ui.switch-on ? Theme.mood-fill(Ui.mood) : #ffffff;
+                    mark-color: #ffffff;
+                    opacity: Ui.switch-pending ? 0.75 : 1;
+                    toggled => { Ui.toggle(); }
+                }
+                if !Ui.live && Ui.can-start: Button {
+                    text: Ui.starting ? "Starting…" : Ui.start-label;
+                    kind: Ui.mood == Mood.failed ? ButtonKind.on-tile : ButtonKind.primary;
+                    tile-text: ink;
+                    enabled: !Ui.starting;
+                    has-icon: true;
+                    icon: IconKind.power;
+                    clicked => { Ui.start-service(); }
+                }
+            }
+        }
+
+        if Ui.live: Rectangle {
+            height: 1px;
+            background: ink.with-alpha(0.18);
+        }
+        if Ui.live: HorizontalLayout {
+            spacing: 18px;
+            TileFact {
+                icon: Ui.device-icon;
+                text: Ui.device-chip;
+                ink: sub;
+                label: "Capturing";
+                horizontal-stretch: 1;
+            }
+            TileFact { icon: IconKind.info; text: Ui.latency-chip; ink: sub; label: "Measured latency"; }
+            TileFact { icon: IconKind.check; text: Ui.drops-chip; ink: Ui.drops-bad ? ink : sub; alarm: Ui.drops-bad; label: "Dropouts"; }
+            TileFact { icon: IconKind.waveform; text: Ui.npu-chip; ink: Ui.npu-bad ? ink : sub; alarm: Ui.npu-bad; label: "Compute"; }
+        }
+        if !Ui.live && Ui.no-service-hint != "": Text {
+            text: Ui.no-service-hint;
+            color: sub;
+            font-family: Theme.family;
+            font-size: Theme.size-small;
+            wrap: word-wrap;
+        }
+    }
+}
+
+component DevicePicker {
+    in property <bool> enabled;
+    VerticalLayout {
+        spacing: 2px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+
+        if Ui.source-missing: Banner {
+            tone: Tone.warn;
+            has-actions: false;
+            title: "“" + Ui.source-description + "” is not connected";
+            body: "DeepFilter Mic is sending silence until it comes back or you choose another microphone below. It will not switch to a different one on its own.";
+        }
+        if Ui.devices.length == 0: Small {
+            text: enabled ? "No microphones found. Plug one in and it will appear here." : "Start DeepFilter Mic to see and choose microphones.";
+            vertical-alignment: center;
+            min-height: 48px;
+        }
+
+        for device[i] in Ui.devices: row := Rectangle {
+            property <bool> first-virtual: device.is-virtual && (i == 0 || !Ui.devices[i - 1].is-virtual);
+            min-height: content.min-height;
+            border-radius: Theme.radius-small;
+            background: device.selected ? Theme.accent-soft
+                : touch.has-hover && enabled ? Theme.raised : transparent;
+            accessible-role: list-item;
+            accessible-label: device.description + ", " + device.kind;
+            accessible-checked: device.selected;
+            accessible-description: device.caution;
+            accessible-action-default => { if enabled && !device.selected { Ui.set-source(device.name); } }
+
+            touch := TouchArea {
+                enabled: root.enabled && !device.selected;
+                mouse-cursor: self.enabled ? pointer : default;
+                clicked => { Ui.set-source(device.name); }
+            }
+            focus := Focusable {
+                enabled: root.enabled;
+                key-pressed(e) => {
+                    if (e.text == Key.Space || e.text == Key.Return) && !device.selected {
+                        Ui.set-source(device.name);
+                        return accept;
+                    }
+                    reject
+                }
+            }
+            FocusRing { show: focus.keyboard-focus; target-w: row.width; target-h: row.height; }
+
+            content := VerticalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 6px;
+                if first-virtual: Small {
+                    text: "Sources made by other software";
+                    font-weight: Theme.medium;
+                }
+                HorizontalLayout {
+                    spacing: 12px;
+                    // Radio mark.
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 9px;
+                            border-width: 2px;
+                            border-color: device.selected ? Theme.accent : Theme.line-strong;
+                            Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                background: Theme.accent;
+                                visible: device.selected;
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Icon { kind: device.icon; color: device.selected ? Theme.text : Theme.muted; size: 20px; }
+                    }
+                    VerticalLayout {
+                        spacing: 4px;
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        Text {
+                            text: device.description;
+                            color: enabled ? Theme.text : Theme.muted;
+                            font-family: Theme.family;
+                            font-size: Theme.size-body;
+                            font-weight: device.selected ? Theme.semibold : Theme.regular;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Badge { text: device.kind; ink: device.caution != "" ? Theme.warn : Theme.muted; }
+                            if device.system-default: Badge { text: "System default"; ink: Theme.info; }
+                        }
+                        if device.caution != "": Small { text: device.caution; }
+                        if device.selected: HorizontalLayout {
+                            spacing: 6px;
+                            // Selectable, so the node name can be copied by hand too.
+                            node := TextInput {
+                                text: device.name;
+                                read-only: true;
+                                single-line: true;
+                                color: Theme.muted;
+                                selection-background-color: Theme.accent-soft;
+                                selection-foreground-color: Theme.text;
+                                font-family: Theme.family;
+                                font-size: Theme.size-tiny;
+                                vertical-alignment: center;
+                                min-width: 0px;
+                                horizontal-stretch: 1;
+                                accessible-label: "PipeWire node name";
+                            }
+                            Button {
+                                text: "Copy node name";
+                                kind: ButtonKind.quiet;
+                                small: true;
+                                has-icon: true;
+                                icon: IconKind.copy;
+                                clicked => {
+                                    node.select-all();
+                                    node.copy();
+                                    node.clear-selection();
+                                    Ui.copied();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A tuning parameter: what you hear, the slider, the value, and a way back.
+component ParamRow {
+    in property <int> index;
+    in property <string> title;
+    in property <string> help;
+    in property <string> value-text;
+    in property <string> lock-reason;
+    in property <bool> enabled;
+
+    property <ParamSpec> spec: Ui.specs[index];
+    property <float> value: Ui.values[index];
+    property <bool> locked: Ui.locked[index];
+    property <bool> at-default: abs(value - spec.default-value) < spec.step / 2;
+
+    VerticalLayout {
+        spacing: 6px;
+        padding-top: 12px;
+        padding-bottom: 12px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: title;
+                color: enabled && !locked ? Theme.text : Theme.muted;
+                font-family: Theme.family;
+                font-size: Theme.size-body;
+                font-weight: Theme.medium;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                wrap: word-wrap;
+            }
+            Text {
+                text: value-text + (at-default ? "  · default" : "");
+                color: at-default ? Theme.muted : Theme.text;
+                font-family: Theme.family;
+                font-size: Theme.size-body;
+                font-weight: at-default ? Theme.regular : Theme.semibold;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                width: 30px;
+                height: 30px;
+                if !at-default && !locked: Button {
+                    width: 30px;
+                    text: "";
+                    kind: ButtonKind.quiet;
+                    small: true;
+                    has-icon: true;
+                    icon: IconKind.reset;
+                    enabled: root.enabled;
+                    accessible-label: "Return " + title + " to default";
+                    clicked => { Ui.reset-param(index); }
+                }
+            }
+        }
+        ParamSlider {
+            value: root.value;
+            minimum: spec.minimum;
+            maximum: spec.maximum;
+            step: spec.step;
+            default-value: spec.default-value;
+            enabled: root.enabled && !locked;
+            label: title;
+            value-text: value-text;
+            changed(v) => { Ui.set-param(index, v); }
+        }
+        Small { text: locked ? lock-reason : help; }
+    }
+}
+
+// Three-way choice for mask reduce, which is not a continuum.
+component Choice3 {
+    in property <int> index;
+    in property <bool> enabled;
+    property <float> value: Ui.values[index];
+    HorizontalLayout {
+        spacing: 6px;
+        alignment: start;
+        for name[i] in ["None", "Max", "Mean"]: Button {
+            text: name;
+            small: true;
+            kind: round(value) == i ? ButtonKind.primary : ButtonKind.secondary;
+            enabled: root.enabled;
+            accessible-checked: round(value) == i;
+            clicked => { Ui.set-param(index, i); }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "DeepFilter Mic";
+    icon: @image-url("../../../nix/icon.png");
+    preferred-width: 560px;
+    preferred-height: 860px;
+    min-width: 460px;
+    min-height: 560px;
+    background: Theme.window;
+    default-font-family: Theme.family;
+    default-font-size: Theme.size-body;
+
+    // Which disclosures and confirmations are open. Only the window uses these.
+    in-out property <bool> confirm-monitor;
+    in-out property <bool> confirm-reset-all;
+    in-out property <bool> tuning-open;
+    in-out property <bool> rare-open;
+    in-out property <bool> details-open;
+
+    // Ctrl+Space toggles suppression from anywhere in the window, whatever has
+    // focus. (Outside the window: `dfmic toggle` or the notification action.)
+    keys := FocusScope {
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        capture-key-pressed(e) => {
+            if e.modifiers.control && e.text == Key.Space && Ui.live {
+                Ui.toggle();
+                return accept;
+            }
+            reject
+        }
+
+        VerticalLayout {
+            padding-top: 16px;
+            spacing: 4px;
+
+            VerticalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 12px;
+
+                Hero { }
+
+                // Self-monitor is loud and can howl: keep it in view while on.
+                if Ui.monitor && Ui.live: Banner {
+                    tone: Ui.monitor-headphones ? Tone.info : Tone.warn;
+                    icon: Ui.monitor-headphones ? IconKind.headphones : IconKind.speaker;
+                    title: "You are hearing your microphone";
+                    body: "Playing on " + Ui.monitor-target + (Ui.monitor-headphones ? "." : Ui.monitor-speakers ? ". Speakers feed back into the microphone; use headphones." : ". If that is a speaker, it will feed back.");
+                    Button {
+                        text: "Stop hearing myself";
+                        small: true;
+                        kind: ButtonKind.primary;
+                        clicked => { Ui.set-monitor(false); }
+                    }
+                }
+            }
+
+            // Full width, so the content lines up with the header above.
+            //
+            // Both scrollbars are off on purpose. The std-widgets thumb carries
+            // `animate width, height`, and an animated property read during a
+            // render drags Slint's animation clock into the frame's dependency
+            // list; the clock ticks on every event loop iteration, so a visible
+            // scrollbar repaints the whole window at the display rate. Measured:
+            // 62 frames/s for 30 meter ticks, 16.9% of a core against 10.5% with
+            // the scrollbars gone. Wheel and trackpad scrolling still work.
+            ScrollView {
+                vertical-stretch: 1;
+                vertical-scrollbar-policy: always-off;
+                horizontal-scrollbar-policy: always-off;
+                content := VerticalLayout {
+                    alignment: start;
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    padding-top: 14px;
+                    padding-bottom: 24px;
+                    spacing: 24px;
+
+                    // Messages that need a decision.
+                    if Ui.failure-title != "": Banner {
+                        tone: Tone.danger;
+                        title: Ui.failure-title;
+                        body: Ui.failure-body;
+                        if Ui.live: Button {
+                            text: "Dismiss";
+                            small: true;
+                            clicked => { Ui.clear-failure(); }
+                        }
+                    }
+                    if Ui.notices-count > 0: Banner {
+                        tone: Tone.warn;
+                        title: Ui.notices-count == 1 ? "A saved setting was corrected" : "Some saved settings were corrected";
+                        body: Ui.notices-text;
+                        Button {
+                            text: "Got it";
+                            small: true;
+                            clicked => { Ui.dismiss-notices(); }
+                        }
+                    }
+
+                    Section {
+                        title: "Levels";
+                        aside: Ui.live ? "dBFS, peak and average" : "";
+                        VerticalLayout {
+                            padding-top: 12px;
+                            padding-bottom: 12px;
+                            spacing: 18px;
+                            Meter {
+                                title: "Microphone";
+                                subtitle: "what is captured";
+                                status: Ui.input.status;
+                                rms-db: Ui.input.rms-db;
+                                peak-db: Ui.input.peak-db;
+                                hold-db: Ui.input.hold-db;
+                                readout: Ui.input.readout;
+                                clipped: Ui.input.clip;
+                                note: Ui.input-note;
+                                reset-clip => { Ui.reset-clip(false); }
+                            }
+                            Meter {
+                                title: "Sent to apps";
+                                subtitle: "what callers hear";
+                                status: Ui.output.status;
+                                rms-db: Ui.output.rms-db;
+                                peak-db: Ui.output.peak-db;
+                                hold-db: Ui.output.hold-db;
+                                readout: Ui.output.readout;
+                                clipped: Ui.output.clip;
+                                note: Ui.output-note;
+                                reset-clip => { Ui.reset-clip(true); }
+                            }
+                            if Ui.live && Ui.agc: HorizontalLayout {
+                                spacing: 10px;
+                                Badge {
+                                    text: "Automatic gain " + Ui.agc-readout;
+                                    ink: Ui.agc-active ? Theme.info : Theme.muted;
+                                    has-icon: true;
+                                    icon: IconKind.waveform;
+                                }
+                                Badge {
+                                    text: Ui.voice ? "Voice detected" : "No voice";
+                                    ink: Ui.voice ? Theme.accent : Theme.muted;
+                                    has-icon: true;
+                                    icon: IconKind.mic;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                        }
+                    }
+
+                    Section {
+                        title: "Compare";
+                        aside: Ui.recording ? "recording" : Ui.has-recording ? "recorded" : "";
+                        VerticalLayout {
+                            padding-top: 12px;
+                            spacing: 10px;
+                            Small {
+                                text: "Records your raw microphone and what apps hear at the same time, so you can listen back to both. Testing live is misleading: what you hear is a few milliseconds late, which makes every setting sound wrong.";
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: Ui.recording ? "Stop" : "Record";
+                                    has-icon: true;
+                                    icon: Ui.recording ? IconKind.cross : IconKind.record;
+                                    kind: Ui.recording ? ButtonKind.secondary : ButtonKind.primary;
+                                    enabled: Ui.live && Ui.playing == "";
+                                    accessible-label: Ui.recording ? "Stop recording" : "Record your microphone and what apps hear";
+                                    clicked => { Ui.toggle-recording(); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            if Ui.recording: HorizontalLayout {
+                                spacing: 10px;
+                                Badge {
+                                    text: "Recording " + Ui.output.readout;
+                                    ink: Theme.accent;
+                                    has-icon: true;
+                                    icon: IconKind.record;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            if Ui.has-recording && !Ui.recording: VerticalLayout {
+                                spacing: 8px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Button {
+                                        text: Ui.playing == "raw" ? "Stop" : "Play raw";
+                                        has-icon: true;
+                                        icon: Ui.playing == "raw" ? IconKind.cross : IconKind.play;
+                                        small: true;
+                                        kind: Ui.playing == "raw" ? ButtonKind.secondary : ButtonKind.primary;
+                                        enabled: Ui.live;
+                                        clicked => { Ui.play-take("raw"); }
+                                    }
+                                    Button {
+                                        text: Ui.playing == "filtered" ? "Stop" : "Play filtered";
+                                        has-icon: true;
+                                        icon: Ui.playing == "filtered" ? IconKind.cross : IconKind.play;
+                                        small: true;
+                                        kind: Ui.playing == "filtered" ? ButtonKind.secondary : ButtonKind.primary;
+                                        enabled: Ui.live;
+                                        clicked => { Ui.play-take("filtered"); }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                if Ui.playing-label != "": HorizontalLayout {
+                                    spacing: 10px;
+                                    Badge {
+                                        text: Ui.playing-label;
+                                        ink: Theme.accent;
+                                        has-icon: true;
+                                        icon: IconKind.play;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+                        }
+                    }
+
+                    Section {
+                        title: "Microphone";
+                        aside: Ui.devices.length > 0 ? "Pick the device DeepFilter Mic listens to" : "";
+                        DevicePicker { enabled: Ui.live; }
+                    }
+
+                    Section {
+                        title: "Sound";
+                        VerticalLayout {
+                            padding-top: 12px;
+                            spacing: 8px;
+                            Segmented {
+                                left: "Full suppression";
+                                right: "Keep some room";
+                                label: "Suppression mode";
+                                right-selected: Ui.soft;
+                                enabled: Ui.live;
+                                choose(right) => { Ui.set-soft(right); }
+                            }
+                            Small {
+                                text: Ui.soft
+                                    ? "Lets music, room tone and reverb through, quieter. Sets " + Ui.soft-summary + ". Switching back restores your own settings exactly."
+                                    : "Removes as much background noise as possible.";
+                            }
+                        }
+                        Rectangle { height: 8px; }
+                        Divider { }
+                        SwitchRow {
+                            title: "Even out my voice level";
+                            detail: "Automatic gain. Brings a quiet voice up after suppression. It only adjusts while you speak, so background noise is never boosted, and it never clips.";
+                            icon: IconKind.waveform;
+                            checked: Ui.agc;
+                            enabled: Ui.live;
+                            toggled => { Ui.set-agc(!Ui.agc); }
+                        }
+                        Divider { }
+                        SwitchRow {
+                            title: "Shorter audio buffers";
+                            detail: "Lets every app on the system use 5 ms audio buffers instead of 21 ms while you are filtering, which takes about 15 ms off the delay. It costs a little CPU everywhere, and is given back as soon as you switch the filter off.";
+                            icon: IconKind.clock;
+                            checked: Ui.graph-quantum;
+                            enabled: Ui.live;
+                            toggled => { Ui.set-graph-quantum(!Ui.graph-quantum); }
+                        }
+                        Divider { }
+                        SwitchRow {
+                            title: "Hear myself";
+                            detail: Ui.monitor-target != ""
+                                ? "Plays what callers will hear on " + Ui.monitor-target + ". Use headphones: on speakers it feeds back."
+                                : "Plays what callers will hear on your output device. Use headphones: on speakers it feeds back.";
+                            icon: Ui.monitor-headphones ? IconKind.headphones : IconKind.ear;
+                            checked: Ui.monitor;
+                            enabled: Ui.live;
+                            toggled => {
+                                if Ui.monitor {
+                                    Ui.set-monitor(false);
+                                } else if Ui.monitor-headphones {
+                                    Ui.set-monitor(true);
+                                } else {
+                                    confirm-monitor = true;
+                                }
+                            }
+                        }
+                        if confirm-monitor && !Ui.monitor: Banner {
+                            tone: Tone.warn;
+                            icon: IconKind.speaker;
+                            title: "Your output looks like speakers";
+                            body: "Sound is playing on " + (Ui.monitor-target != "" ? Ui.monitor-target : "a device that may be speakers") + ". The microphone will pick it up and howl. Put headphones on first.";
+                            Button {
+                                text: "Play anyway";
+                                small: true;
+                                kind: ButtonKind.primary;
+                                clicked => {
+                                    confirm-monitor = false;
+                                    Ui.set-monitor(true);
+                                }
+                            }
+                            Button {
+                                text: "Cancel";
+                                small: true;
+                                clicked => { confirm-monitor = false; }
+                            }
+                        }
+                        Rectangle { height: 6px; }
+                    }
+
+                    Section {
+                        title: "Fine-tuning";
+                        aside: Ui.params-at-default ? "All at recommended values" : "Changed from recommended";
+                        Disclosure {
+                            title: tuning-open ? "Hide fine-tuning" : "Show fine-tuning";
+                            detail: "Not needed for normal use. Each slider marks its recommended value with a notch; double-click a slider to return to it.";
+                            open <=> tuning-open;
+                        }
+                        if tuning-open: VerticalLayout {
+                            if Ui.soft: Banner {
+                                tone: Tone.info;
+                                has-actions: false;
+                                title: "“Keep some room” is setting the first two";
+                                body: "Your own values for them are kept and come back when you switch to Full suppression.";
+                            }
+                            ParamRow {
+                                index: 0;
+                                enabled: Ui.live;
+                                title: "Noise reduction limit";
+                                help: "How far noise is pushed down. Lower keeps more of the room and any music; 100 removes as much as it can.";
+                                value-text: Ui.values[0] >= 100 ? "No limit" : round(Ui.values[0]) + " dB";
+                                lock-reason: "Set to " + round(Ui.values[0]) + " dB by “Keep some room”.";
+                            }
+                            Divider { }
+                            ParamRow {
+                                index: 1;
+                                enabled: Ui.live;
+                                title: "Extra cleanup between words";
+                                help: "Pushes leftover noise down further when you pause. Too much makes your voice sound thin and watery.";
+                                value-text: Ui.values[1] <= 0 ? "Off" : Ui.values[1].to-fixed(3);
+                                lock-reason: "Turned off by “Keep some room”.";
+                            }
+                            Divider { }
+                            Disclosure {
+                                title: "Rarely helpful";
+                                detail: "These usually make things worse. Change one at a time and listen with “Hear myself”.";
+                                open <=> rare-open;
+                            }
+                            if rare-open: VerticalLayout {
+                                ParamRow {
+                                    index: 2;
+                                    enabled: Ui.live;
+                                    title: "Mute when noise drowns out speech";
+                                    help: "When your voice is this far below the noise, that moment is muted outright. Raise it to cut more breathing and distant chatter; too high cuts off quiet words.";
+                                    value-text: round(Ui.values[2]) + " dB";
+                                }
+                                Divider { }
+                                ParamRow {
+                                    index: 3;
+                                    enabled: Ui.live;
+                                    title: "Leave clear speech untouched";
+                                    help: "When your voice is this far above the noise, the filter steps aside completely. Lower it for a more natural voice on clear speech; more background comes through with it.";
+                                    value-text: round(Ui.values[3]) + " dB";
+                                }
+                                Divider { }
+                                ParamRow {
+                                    index: 4;
+                                    enabled: Ui.live;
+                                    title: "Skip fine detail on clear speech";
+                                    help: "Above this, the second, fine-detail stage is skipped. Lower it and low hum or rumble can come through while you talk.";
+                                    value-text: round(Ui.values[4]) + " dB";
+                                }
+                                Divider { }
+                                ParamRow {
+                                    index: 5;
+                                    enabled: Ui.live;
+                                    title: "Safety buffer";
+                                    help: "Holds back extra audio to ride out processing hiccups. Each step adds 10 ms of delay. Leave at 0 unless dropouts keep climbing.";
+                                    value-text: round(Ui.values[5]) == 0 ? "None" : round(Ui.values[5]) + (round(Ui.values[5]) == 1 ? " frame · +10 ms" : " frames · +" + round(Ui.values[5]) * 10 + " ms");
+                                }
+                                Divider { }
+                                VerticalLayout {
+                                    spacing: 8px;
+                                    padding-top: 12px;
+                                    padding-bottom: 14px;
+                                    HorizontalLayout {
+                                        Text {
+                                            text: "Multi-channel mask merge";
+                                            color: Theme.text;
+                                            font-family: Theme.family;
+                                            font-size: Theme.size-body;
+                                            font-weight: Theme.medium;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Text {
+                                            text: round(Ui.values[6]) == round(Ui.specs[6].default-value) ? "default" : "";
+                                            color: Theme.muted;
+                                            font-family: Theme.family;
+                                            font-size: Theme.size-body;
+                                        }
+                                    }
+                                    Choice3 { index: 6; enabled: Ui.live; }
+                                    Small { text: "Only matters with several input channels. Your microphone is captured in mono, so this has no audible effect."; }
+                                }
+                            }
+                            Divider { }
+                            HorizontalLayout {
+                                padding-top: 12px;
+                                padding-bottom: 12px;
+                                alignment: start;
+                                Button {
+                                    text: "Restore recommended values";
+                                    has-icon: true;
+                                    icon: IconKind.reset;
+                                    enabled: Ui.live && !Ui.params-at-default;
+                                    clicked => { Ui.reset-params(); }
+                                }
+                            }
+                        }
+                    }
+
+                    Section {
+                        title: "Diagnostics";
+                        Disclosure {
+                            title: "Latency " + Ui.latency-total;
+                            detail: "Measured from the microphone to the app, including PipeWire's own buffering, not just the model.";
+                            open <=> details-open;
+                        }
+                        if details-open: VerticalLayout {
+                            padding-bottom: 12px;
+                            spacing: 2px;
+                            for part in Ui.latency-parts: HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 12px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 2px;
+                                    Body { text: part.label; }
+                                    Small { text: part.explain; }
+                                }
+                                Body {
+                                    text: part.value;
+                                    horizontal-alignment: right;
+                                    font-weight: Theme.medium;
+                                    wrap: no-wrap;
+                                }
+                            }
+                            if Ui.latency-parts.length == 0: Small {
+                                text: "Nothing is recording from DeepFilter Mic, so there is no path to measure. Open a call, or turn on “Hear myself”.";
+                            }
+                        }
+                        Divider { }
+                        VerticalLayout {
+                            padding-top: 10px;
+                            padding-bottom: 16px;
+                            spacing: 10px;
+                            for fact in [
+                                { label: "Compute", value: Ui.compute-device, explain: "DeepFilterNet runs only here. If it fails, the filter stops; it never falls back to the CPU." },
+                                { label: "Time per 10 ms of audio", value: Ui.inference-text, explain: "Must stay under 10 ms to keep up in real time." },
+                                { label: "Dropped input", value: Ui.overruns-text, explain: "Audio thrown away because processing fell behind." },
+                                { label: "Gaps sent to apps", value: Ui.underruns-text, explain: "Moments an app asked for audio that was not ready yet." },
+                                { label: "Frames processed", value: Ui.inferences-text, explain: "" },
+                            ]: HorizontalLayout {
+                                spacing: 12px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 2px;
+                                    Body { text: fact.label; }
+                                    if fact.explain != "": Small { text: fact.explain; }
+                                }
+                                Body {
+                                    text: fact.value;
+                                    horizontal-alignment: right;
+                                    font-weight: Theme.medium;
+                                    wrap: no-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    Section {
+                        title: "System";
+                        SwitchRow {
+                            title: "Make it the default microphone";
+                            detail: Ui.default-detail;
+                            icon: IconKind.mic;
+                            checked: Ui.take-default;
+                            enabled: Ui.live;
+                            toggled => { Ui.set-take-default(!Ui.take-default); }
+                        }
+                        Divider { }
+                        SwitchRow {
+                            title: "Start at login";
+                            detail: !Ui.autostart-known ? "Could not ask systemd whether the service is enabled."
+                                : Ui.autostart ? "DeepFilter Mic starts with your session, even if this window is never opened."
+                                : "DeepFilter Mic only runs when you start it.";
+                            icon: IconKind.power;
+                            checked: Ui.autostart;
+                            enabled: Ui.autostart-known;
+                            toggled => { Ui.set-autostart(!Ui.autostart); }
+                        }
+                        Divider { }
+                        SwitchRow {
+                            title: "Desktop notifications";
+                            detail: "Tells you when the filter turns on or off, fails, or loses its microphone, with a button to toggle it.";
+                            icon: IconKind.info;
+                            checked: Ui.notify;
+                            enabled: Ui.live;
+                            toggled => { Ui.set-notify(!Ui.notify); }
+                        }
+                        Divider { }
+                        VerticalLayout {
+                            padding-top: 12px;
+                            padding-bottom: 12px;
+                            spacing: 10px;
+                            if !confirm-reset-all: HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "Reset all settings…";
+                                    enabled: Ui.live;
+                                    clicked => { confirm-reset-all = true; }
+                                }
+                            }
+                            if confirm-reset-all: Banner {
+                                tone: Tone.danger;
+                                title: "Reset every setting?";
+                                body: "The saved microphone, sound options and fine-tuning for every device go back to their defaults. Start at login is left as it is.";
+                                Button {
+                                    text: "Reset everything";
+                                    small: true;
+                                    kind: ButtonKind.danger;
+                                    clicked => {
+                                        confirm-reset-all = false;
+                                        Ui.reset-all();
+                                    }
+                                }
+                                Button {
+                                    text: "Cancel";
+                                    small: true;
+                                    clicked => { confirm-reset-all = false; }
+                                }
+                            }
+                        }
+                    }
+
+                    Small {
+                        text: "Ctrl+Space turns suppression on or off from anywhere in this window. For a desktop shortcut, bind it to “dfmic toggle”.";
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Transient message, e.g. an action the daemon refused, or "Undo".
+        if Ui.toast != "": toast := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: parent.height - self.height - 20px;
+            width: min(parent.width - 40px, 480px);
+            height: toast-layout.min-height;
+            border-radius: Theme.radius-small + 2px;
+            background: Theme.dark ? #eceef0 : #1f2327;
+            drop-shadow-blur: 16px;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-color: #00000055;
+            accessible-role: AccessibleRole.text;
+            accessible-label: Ui.toast;
+            toast-layout := HorizontalLayout {
+                padding: 12px;
+                padding-left: 16px;
+                spacing: 8px;
+                Text {
+                    text: Ui.toast;
+                    color: Theme.dark ? #14171a : #eceef0;
+                    font-family: Theme.family;
+                    font-size: Theme.size-body;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+                if Ui.toast-action != "": Button {
+                    text: Ui.toast-action;
+                    small: true;
+                    kind: ButtonKind.on-tile;
+                    tile-text: Theme.dark ? #0d7a56 : #3ccf9a;
+                    clicked => { Ui.toast-activate(); }
+                }
+                Button {
+                    width: 30px;
+                    text: "";
+                    small: true;
+                    kind: ButtonKind.on-tile;
+                    tile-text: Theme.dark ? #14171a : #eceef0;
+                    has-icon: true;
+                    icon: IconKind.cross;
+                    accessible-label: "Dismiss";
+                    clicked => { Ui.toast-dismiss(); }
+                }
+            }
+        }
+    }
+}

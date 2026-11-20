@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use dfn_dsp::{DfnPipeline, EncoderOutput, ModelRuntime, Params, HOP_SIZE, NB_DF, DF_ORDER};
+use dfn_dsp::{DfnPipeline, EncoderOutput, ModelRuntime, Params, DF_ORDER, HOP_SIZE, NB_DF};
 use num_complex::Complex32;
 
 use crate::wav;
@@ -44,7 +44,10 @@ impl Replay {
                 .ok_or_else(|| format!("bad trace line: {line}"))?;
             let coefs = coefs.trim_end_matches(']');
             frames.push(Frame {
-                lsnr: lsnr.trim().parse().map_err(|_| format!("bad lsnr: {line}"))?,
+                lsnr: lsnr
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("bad lsnr: {line}"))?,
                 gains: parse_list(gains)?,
                 coefs: parse_list(coefs)?,
             });
@@ -65,24 +68,19 @@ fn parse_list(s: &str) -> Result<Vec<f32>, String> {
         return Ok(Vec::new());
     }
     s.split(',')
-        .map(|x| x.trim().parse::<f32>().map_err(|_| format!("bad number {x:?}")))
+        .map(|x| {
+            x.trim()
+                .parse::<f32>()
+                .map_err(|_| format!("bad number {x:?}"))
+        })
         .collect()
 }
 
 impl ModelRuntime for Replay {
-    fn encode(&mut self, _feat_erb: &[f32], _feat_spec: &[f32]) -> EncoderOutput {
+    fn encode_into(&mut self, _feat_erb: &[f32], _feat_spec: &[f32], out: &mut EncoderOutput) {
         self.current = self.next;
         self.next = (self.next + 1) % self.frames.len();
-        let f = &self.frames[self.current];
-        EncoderOutput {
-            emb: Vec::new(),
-            c0: Vec::new(),
-            lsnr: f.lsnr,
-            e0: Vec::new(),
-            e1: Vec::new(),
-            e2: Vec::new(),
-            e3: Vec::new(),
-        }
+        out.lsnr = self.frames[self.current].lsnr;
     }
 
     fn erb_mask(&mut self, _enc: &EncoderOutput) -> [f32; dfn_dsp::NB_ERB] {
@@ -116,6 +114,8 @@ pub fn run(trace: &Path, input: &Path, output: &Path) -> Result<(), String> {
             min_db_thresh: -15.,
             max_db_erb_thresh: 35.,
             max_db_df_thresh: 35.,
+            min_buffer: 0,
+            mask_reduce: dfn_dsp::MaskReduce::None,
         },
     );
 

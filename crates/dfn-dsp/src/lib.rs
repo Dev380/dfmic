@@ -296,15 +296,52 @@ pub fn post_filter(noisy: &[Complex32], enh: &mut [Complex32], beta: f32) {
 /// Implementations own all recurrence state and must be fed exactly one frame per
 /// call to [`DfnPipeline::process`].
 pub trait ModelRuntime {
-    /// Encoder forward pass for one frame. Returns the embedding, the deep-filter
-    /// features, the local SNR estimate and the four skip features.
-    fn encode(&mut self, feat_erb: &[f32], feat_spec: &[f32]) -> EncoderOutput;
+    /// Encoder forward pass for one frame, written into `out`.
+    ///
+    /// Takes the destination rather than returning one: this runs 100 times a
+    /// second and the encoder has six outputs, so returning them meant six
+    /// allocations and six copies per hop. `out` is resized on the first call
+    /// and reused thereafter.
+    fn encode_into(&mut self, feat_erb: &[f32], feat_spec: &[f32], out: &mut EncoderOutput);
 
     /// First-stage mask for one frame: `NB_ERB` band gains.
     fn erb_mask(&mut self, enc: &EncoderOutput) -> [f32; NB_ERB];
 
     /// Deep-filter coefficients for one frame, `NB_DF * DF_ORDER` complex taps.
     fn df_coefs(&mut self, enc: &EncoderOutput) -> Vec<Complex32>;
+}
+
+impl EncoderOutput {
+    /// Resize every output to `len`, keeping the allocation when it already
+    /// matches. Called on the first hop and whenever the model shape changes.
+    pub fn resize(&mut self, emb: usize, c0: usize, skip: usize) {
+        for (slot, len) in [
+            (&mut self.emb, emb),
+            (&mut self.c0, c0),
+            (&mut self.e0, skip),
+            (&mut self.e1, skip),
+            (&mut self.e2, skip),
+            (&mut self.e3, skip),
+        ] {
+            if slot.len() != len {
+                slot.resize(len, 0.0);
+            }
+        }
+    }
+}
+
+impl Default for EncoderOutput {
+    fn default() -> Self {
+        Self {
+            emb: Vec::new(),
+            c0: Vec::new(),
+            lsnr: 0.0,
+            e0: Vec::new(),
+            e1: Vec::new(),
+            e2: Vec::new(),
+            e3: Vec::new(),
+        }
+    }
 }
 
 /// Encoder outputs for a single frame.
@@ -316,6 +353,39 @@ pub struct EncoderOutput {
     pub e1: Vec<f32>,
     pub e2: Vec<f32>,
     pub e3: Vec<f32>,
+}
+
+/// libDF's optional reduction of channel masks before applying them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MaskReduce {
+    #[default]
+    None,
+    Max,
+    Mean,
+}
+
+/// Apply libDF's `ReduceMask` operation across equally sized channel masks.
+/// Mono deliberately remains unchanged.
+pub fn reduce_channel_masks(masks: &mut [&mut [f32]], reduce: MaskReduce) {
+    if masks.len() < 2 || reduce == MaskReduce::None {
+        return;
+    }
+    let bands = masks[0].len();
+    assert!(masks.iter().all(|mask| mask.len() == bands));
+    for band in 0..bands {
+        let value = match reduce {
+            MaskReduce::None => unreachable!(),
+            MaskReduce::Max => masks
+                .iter()
+                .fold(f32::NEG_INFINITY, |value, mask| value.max(mask[band])),
+            MaskReduce::Mean => {
+                masks.iter().map(|mask| mask[band]).sum::<f32>() / masks.len() as f32
+            }
+        };
+        for mask in masks.iter_mut() {
+            mask[band] = value;
+        }
+    }
 }
 
 /// Runtime parameters, mirroring libDF's `RuntimeParams`.
@@ -331,6 +401,10 @@ pub struct Params {
     pub max_db_erb_thresh: f32,
     /// Above this local SNR the deep filter is skipped.
     pub max_db_df_thresh: f32,
+    /// Minimum number of processed hops retained before the queue is shortened.
+    pub min_buffer: u32,
+    /// Cross-channel ERB mask reduction. This pipeline is mono.
+    pub mask_reduce: MaskReduce,
 }
 
 impl Default for Params {
@@ -343,6 +417,8 @@ impl Default for Params {
             min_db_thresh: -10.,
             max_db_erb_thresh: 30.,
             max_db_df_thresh: 20.,
+            min_buffer: 0,
+            mask_reduce: MaskReduce::None,
         }
     }
 }
@@ -385,6 +461,16 @@ pub struct DfnPipeline<R: ModelRuntime> {
     spec: Vec<Complex32>,
     feat_erb: [f32; NB_ERB],
     feat_spec: Vec<f32>,
+    /// Scratch for the complex features. Kept here rather than allocated per
+    /// hop: this runs 100 times a second, and the allocation showed up in the
+    /// profile (`_int_malloc`, `to_vec`) as a measurable cost.
+    cplx: Vec<Complex32>,
+    /// Reused encoder output buffer: see [`ModelRuntime::encode_into`].
+    enc: EncoderOutput,
+    /// Whether to dump frames for `replay-dsp`. Read once: `std::env::var`
+    /// allocates and locks the environment, which is far too expensive to do on
+    /// the audio path (it was ~1% of the worker's CPU).
+    dump: bool,
 }
 
 impl<R: ModelRuntime> DfnPipeline<R> {
@@ -402,6 +488,9 @@ impl<R: ModelRuntime> DfnPipeline<R> {
             spec: vec![Complex32::default(); N_FREQS],
             feat_erb: [0.0; NB_ERB],
             feat_spec: vec![0.0; NB_DF * 2],
+            cplx: vec![Complex32::default(); NB_DF],
+            enc: EncoderOutput::default(),
+            dump: std::env::var_os("DFMIC_DUMP").is_some(),
             params,
         }
     }
@@ -442,33 +531,39 @@ impl<R: ModelRuntime> DfnPipeline<R> {
         }
 
         // Features and the network's first pass.
-        let mut cplx = vec![Complex32::default(); NB_DF];
-        self.state.feat_erb(&self.spec, self.alpha, &mut self.feat_erb);
-        self.state.feat_cplx(&self.spec[..NB_DF], self.alpha, &mut cplx);
+        self.state
+            .feat_erb(&self.spec, self.alpha, &mut self.feat_erb);
+        self.state
+            .feat_cplx(&self.spec[..NB_DF], self.alpha, &mut self.cplx);
         // The encoder wants real/imaginary planes: [2, nb_df].
-        for (i, c) in cplx.iter().enumerate() {
+        for (i, c) in self.cplx.iter().enumerate() {
             self.feat_spec[i] = c.re;
             self.feat_spec[NB_DF + i] = c.im;
         }
 
-        let enc = self.runtime.encode(&self.feat_erb, &self.feat_spec);
-        let lsnr = enc.lsnr;
+        self.runtime
+            .encode_into(&self.feat_erb, &self.feat_spec, &mut self.enc);
+        let lsnr = self.enc.lsnr;
         let (apply_gains, apply_zero, apply_df) = self.params.apply_stages(lsnr);
 
         let gains = if apply_gains {
-            Some(self.runtime.erb_mask(&enc))
+            let mut gains = self.runtime.erb_mask(&self.enc);
+            // This is the same operation libDF inserts in its multi-channel
+            // decoder graph. One channel is intentionally a no-op.
+            reduce_channel_masks(&mut [gains.as_mut_slice()], self.params.mask_reduce);
+            Some(gains)
         } else if apply_zero {
             Some([0.0f32; NB_ERB])
         } else {
             None
         };
         let coefs = if apply_df {
-            Some(self.runtime.df_coefs(&enc))
+            Some(self.runtime.df_coefs(&self.enc))
         } else {
             None
         };
 
-        if std::env::var("DFMIC_DUMP").is_ok() {
+        if self.dump {
             // Same format as libDF's DF_DUMP, so `replay-dsp` can consume either.
             let g: Vec<f32> = gains.map(|g| g.to_vec()).unwrap_or_default();
             let c: Vec<f32> = coefs
@@ -572,7 +667,12 @@ mod tests {
             }
         }
         println!("best lag {} samples -> {:.1} dB", best.1, best.0);
-        assert!(best.0 > 100.0, "round trip SDR only {:.1} dB at lag {}", best.0, best.1);
+        assert!(
+            best.0 > 100.0,
+            "round trip SDR only {:.1} dB at lag {}",
+            best.0,
+            best.1
+        );
     }
 
     #[test]

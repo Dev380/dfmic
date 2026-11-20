@@ -84,18 +84,64 @@ pub fn doctor(models: &Path, device: &str) -> Result<(), String> {
 
     let started = Instant::now();
     let runtime = NpuRuntime::load(models, device, None)?;
-    println!("compiled on {device} in {:.2} s", started.elapsed().as_secs_f64());
+    println!(
+        "compiled on {device} in {:.2} s",
+        started.elapsed().as_secs_f64()
+    );
 
     // One second of synthetic audio, so the timing is a real end-to-end figure.
-    let mut pipeline = DfnPipeline::new(runtime, Params::default());
-    let block = vec![0.01f32; HOP_SIZE];
+    //
+    // The signal has to keep every stage running, or the number is meaningless:
+    // the DSP skips the ERB gains and the deep filter when the estimated SNR is
+    // high (a clean tone) *and* when it is very low (plain noise), so both of
+    // those measured only the encoder, at roughly a third of the real cost.
+    // Real microphone audio sits in the band where all three graphs run. Rather
+    // than hunt for a synthetic signal that lands there, the SNR thresholds are
+    // raised so the stages are unconditional: this is the cost of the full path,
+    // which is what a real room actually pays.
+    // `min_db_thresh` is checked first and catches very low SNR, so all three
+    // gates have to be opened, not just the two upper ones.
+    let params = Params {
+        min_db_thresh: f32::MIN,
+        max_db_erb_thresh: f32::MAX,
+        max_db_df_thresh: f32::MAX,
+        ..Params::default()
+    };
+    let mut pipeline = DfnPipeline::new(runtime, params);
+    let mut block = vec![0.0f32; HOP_SIZE];
     let mut out = vec![0.0f32; HOP_SIZE];
-    let n = 100;
-    let t0 = Instant::now();
+    let mut noise = 0x2545_f491u32;
+    let mut random = || {
+        // xorshift: deterministic, so repeated runs are comparable.
+        noise ^= noise << 13;
+        noise ^= noise >> 17;
+        noise ^= noise << 5;
+        (noise as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let n: usize = std::env::var("DFMIC_DOCTOR_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let mut spent = 0.0f64;
     for _ in 0..n {
+        for sample in block.iter_mut() {
+            *sample = 0.05 * random();
+        }
+        let hop_started = Instant::now();
         pipeline.process(&block, &mut out);
+        let hop = hop_started.elapsed().as_secs_f64();
+        spent += hop;
+        if std::env::var("DFMIC_DOCTOR_HOPS").is_ok() {
+            eprintln!("HOP {:.3}", hop * 1000.0);
+        }
+        // Pace like the daemon: one hop every 10 ms.
+        if std::env::var("DFMIC_DOCTOR_PACED").is_ok() {
+            std::thread::sleep(
+                std::time::Duration::from_millis(10).saturating_sub(hop_started.elapsed()),
+            );
+        }
     }
-    let per_frame = t0.elapsed().as_secs_f64() / n as f64;
+    let per_frame = spent / n as f64;
     println!(
         "steady state: {:.2} ms per {:.0} ms frame ({:.1}x realtime, {:.0}% duty)",
         per_frame * 1000.0,
@@ -129,7 +175,10 @@ pub fn dump_features(input: &Path, models: Option<&Path>) -> Result<(), String> 
     println!("first8 {:?}", &audio.samples[..8]);
     println!("len {}", audio.samples.len());
     println!("erb {:?}", state.erb);
-    let hops: usize = std::env::var("DFMIC_HOPS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let hops: usize = std::env::var("DFMIC_HOPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
     for hop in 0..hops {
         let start = hop * HOP_SIZE;
         let block = &audio.samples[start..start + HOP_SIZE];
@@ -143,7 +192,10 @@ pub fn dump_features(input: &Path, models: Option<&Path>) -> Result<(), String> 
         }
         // Machine-readable per-frame features for cross-checking the network path.
         let erb_csv: Vec<String> = erb.iter().map(|v| format!("{v:.7}")).collect();
-        let spec_csv: Vec<String> = cplx.iter().flat_map(|c| [format!("{:.7}", c.re), format!("{:.7}", c.im)]).collect();
+        let spec_csv: Vec<String> = cplx
+            .iter()
+            .flat_map(|c| [format!("{:.7}", c.re), format!("{:.7}", c.im)])
+            .collect();
         println!("F {hop} E {} S {}", erb_csv.join(","), spec_csv.join(","));
 
         // Same features through the NPU graphs, for cross-checking against the
@@ -154,7 +206,10 @@ pub fn dump_features(input: &Path, models: Option<&Path>) -> Result<(), String> 
                 feat_spec[i] = c.re;
                 feat_spec[NB_DF + i] = c.im;
             }
-            let enc = pipeline.runtime_mut().encode(&erb, &feat_spec);
+            let mut enc = dfn_dsp::EncoderOutput::default();
+            pipeline
+                .runtime_mut()
+                .encode_into(&erb, &feat_spec, &mut enc);
             println!("N {hop} lsnr {:.6} emb {:?}", enc.lsnr, &enc.emb[..4]);
         }
     }

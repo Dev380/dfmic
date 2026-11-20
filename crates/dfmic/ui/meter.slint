@@ -1,0 +1,185 @@
+// A level meter on a real dBFS scale. All ballistics (instant attack, smooth
+// release, peak hold) are computed by the caller at a steady frame rate; this
+// component only draws what it is told.
+
+import { Theme } from "theme.slint";
+
+export enum MeterStatus {
+    live,        // samples are flowing
+    silent,      // samples are flowing and they are all exactly zero
+    no-signal,   // the device delivered nothing at all
+    unused,      // nothing is recording from the virtual microphone
+    unavailable, // no daemon to ask
+}
+
+export component Meter {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <MeterStatus> status;
+    in property <float> rms-db: -100;
+    in property <float> peak-db: -100;
+    in property <float> hold-db: -100;
+    in property <string> readout;  // formatted by the caller, steady (not per frame)
+    in property <bool> clipped;    // latched by the caller
+    in property <string> note;     // explanation when not live
+    callback reset-clip;
+
+    // The scale. -60 dBFS is the floor; anything below is drawn empty but the
+    // readout still gives the number.
+    property <float> floor: -60;
+    property <float> hot: -9;   // amber from here
+    property <float> red: -1;   // red from here
+    property <bool> active: status == MeterStatus.live;
+
+    pure function frac(db: float) -> float {
+        return clamp((db - floor) / (0 - floor), 0, 1);
+    }
+
+    accessible-role: progress-indicator;
+    accessible-label: title;
+    accessible-value: readout + (clipped ? ", clipped" : "");
+
+    VerticalLayout {
+        spacing: 6px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: title;
+                color: Theme.text;
+                font-family: Theme.family;
+                font-size: Theme.size-body;
+                font-weight: Theme.semibold;
+                vertical-alignment: center;
+            }
+            Text {
+                text: subtitle;
+                color: Theme.muted;
+                font-family: Theme.family;
+                font-size: Theme.size-small;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: readout;
+                color: active ? Theme.text : Theme.muted;
+                font-family: Theme.family;
+                font-size: Theme.size-body;
+                font-weight: Theme.medium;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                min-width: 92px;
+            }
+            // Clip lamp: always present so the layout never jumps; lit when latched.
+            clip-lamp := Rectangle {
+                width: 44px;
+                height: 22px;
+                border-radius: 5px;
+                background: clipped ? Theme.meter-clip : transparent;
+                border-width: 1px;
+                border-color: clipped ? Theme.meter-clip : Theme.line;
+                accessible-role: button;
+                accessible-label: clipped ? "Clipped. Reset clip indicator" : "No clipping";
+                Text {
+                    text: "CLIP";
+                    color: clipped ? #ffffff : Theme.faint;
+                    font-family: Theme.family;
+                    font-size: Theme.size-tiny;
+                    font-weight: Theme.semibold;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    enabled: clipped;
+                    mouse-cursor: clipped ? pointer : default;
+                    clicked => { root.reset-clip(); }
+                }
+            }
+        }
+
+        bar := Rectangle {
+            height: 18px;
+            border-radius: 4px;
+            background: Theme.sunken;
+            clip: true;
+
+            // Peak: the same zones, translucent, behind the RMS body.
+            Rectangle {
+                x: 0;
+                width: parent.width * (active ? frac(peak-db) : 0);
+                clip: true;
+                Rectangle {
+                    x: 0;
+                    width: bar.width;
+                    opacity: 0.42;
+                    background: @linear-gradient(90deg,
+                        Theme.meter-ok 0%, Theme.meter-ok 85%,
+                        Theme.meter-hot 85%, Theme.meter-hot 98.3%,
+                        Theme.meter-clip 98.3%, Theme.meter-clip 100%);
+                }
+            }
+            // RMS: the body of the signal.
+            Rectangle {
+                x: 0;
+                width: parent.width * (active ? frac(rms-db) : 0);
+                clip: true;
+                Rectangle {
+                    x: 0;
+                    width: bar.width;
+                    background: @linear-gradient(90deg,
+                        Theme.meter-ok 0%, Theme.meter-ok 85%,
+                        Theme.meter-hot 85%, Theme.meter-hot 98.3%,
+                        Theme.meter-clip 98.3%, Theme.meter-clip 100%);
+                }
+            }
+            // Reference lines through the bar so the scale reads inside it too.
+            for db in [-48, -36, -24, -12, -6]: Rectangle {
+                x: bar.width * frac(db);
+                width: 1px;
+                background: Theme.window.with-alpha(0.55);
+            }
+            // Peak hold.
+            if active && hold-db > floor: Rectangle {
+                x: min(bar.width - 2px, bar.width * frac(hold-db) - 1px);
+                width: 2px;
+                background: hold-db >= red ? Theme.meter-clip : Theme.text;
+            }
+            // Not live: say why inside the bar instead of drawing an empty one.
+            if !active: Text {
+                x: 10px;
+                text: status == MeterStatus.silent ? "Digital silence"
+                    : status == MeterStatus.no-signal ? "No audio from the device"
+                    : status == MeterStatus.unused ? "Not in use"
+                    : "Unavailable";
+                color: Theme.muted;
+                font-family: Theme.family;
+                font-size: Theme.size-tiny;
+                font-weight: Theme.medium;
+                vertical-alignment: center;
+            }
+        }
+
+        // Labelled reference points.
+        scale := Rectangle {
+            height: 14px;
+            for db in [-60, -48, -36, -24, -12, -6, 0]: Text {
+                property <length> pos: scale.width * frac(db);
+                x: db == -60 ? 0 : db == 0 ? scale.width - self.width : pos - self.width / 2;
+                text: db == 0 ? "0" : "−" + (-db);
+                color: Theme.muted;
+                font-family: Theme.family;
+                font-size: Theme.size-tiny;
+                accessible-role: none;
+            }
+        }
+
+        if note != "": Text {
+            text: note;
+            color: Theme.muted;
+            font-family: Theme.family;
+            font-size: Theme.size-small;
+            wrap: word-wrap;
+        }
+    }
+}

@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Run dfmic with CAP_SYS_NICE, so its NPU worker can ask for realtime priority,
+# without leaving your session.
+#
+# Why this exists
+# ---------------
+# The NPU worker runs at normal priority without that capability, which lengthens
+# its worst case from ~20 ms to ~50 ms. Getting the capability the obvious ways
+# does not work:
+#
+#   * `sudo dfmic run` runs the daemon as root, outside your session: it cannot
+#     reach your session bus, so the GUI and `dfmic status` cannot talk to it,
+#     and it must not touch your session's PipeWire.
+#   * `sudo -E` does not help. sudo is setuid, so glibc starts it in
+#     secure-execution mode and discards `LD_LIBRARY_PATH` before sudo runs;
+#     `-E` can only preserve what is still there.
+#   * `setcap cap_sys_nice+ep dfmic` grants the capability, but the same
+#     secure-execution mode then drops `LD_LIBRARY_PATH` for the daemon too,
+#     which breaks the GUI: Slint's winit backend loads libwayland and libEGL
+#     with dlopen, and those only resolve through the dev shell's library path.
+#     (Hence "The wayland library could not be loaded".) A file capability also
+#     has to be reapplied after every rebuild.
+#
+# Ambient capabilities have neither problem: they are applied after exec, so
+# secure-execution mode never engages, `LD_LIBRARY_PATH` survives, and the
+# process still runs as you. That is what this script sets up.
+#
+# Usage
+# -----
+#   tools/dfmic-rt run [--source NAME ...]   the daemon
+#   tools/dfmic-rt gui                       the window
+#   tools/dfmic-rt status                    any other subcommand
+#   tools/dfmic-rt --bin path/to/dfmic run   a different binary
+#
+# Needs to run inside the dev shell (`direnv allow`, or `nix develop`) so that
+# the library path and DFMIC_MODELS are set; both are handed to the daemon.
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+bin=$root/target/release/dfmic
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --bin)
+      bin=${2:?--bin needs a path}
+      shift 2
+      ;;
+    -h | --help)
+      sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *) break ;;
+  esac
+done
+
+if [[ ! -x $bin ]]; then
+  echo "dfmic-rt: $bin does not exist; build it first with" >&2
+  echo "  cargo build --release --features gui" >&2
+  exit 1
+fi
+
+if [[ -z ${LD_LIBRARY_PATH:-} ]]; then
+  echo "dfmic-rt: warning: LD_LIBRARY_PATH is empty, so this is not a dev shell." >&2
+  echo "  Run 'direnv allow' first, or the daemon will not find libpipewire." >&2
+fi
+
+# Values are expanded here, in the unprivileged shell, and travel as arguments
+# to `env`, which re-establishes them for the child. Passing them as environment
+# variables would not survive sudo's secure-execution mode.
+forward=()
+for name in HOME USER LOGNAME XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_STATE_HOME \
+  XDG_DATA_HOME XDG_CACHE_HOME DBUS_SESSION_BUS_ADDRESS WAYLAND_DISPLAY DISPLAY \
+  LD_LIBRARY_PATH DFMIC_MODELS SLINT_BACKEND; do
+  if [[ -n ${!name:-} ]]; then
+    forward+=("$name=${!name}")
+  fi
+done
+
+exec sudo setpriv \
+  --ruid="$(id -u)" --euid="$(id -u)" \
+  --rgid="$(id -g)" --egid="$(id -g)" --init-groups \
+  --inh-caps=+sys_nice --ambient-caps=+sys_nice --bounding-set=+sys_nice \
+  env "${forward[@]}" "$bin" "$@"

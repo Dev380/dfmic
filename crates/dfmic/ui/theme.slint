@@ -1,0 +1,95 @@
+// Colours, type and spacing for the whole window. Light and dark follow the
+// desktop's colour scheme (Slint reads it from the XDG portal and tracks
+// changes). Every text/background pair that carries meaning is chosen for at
+// least WCAG AA contrast (4.5:1 for body text, 3:1 for large text and UI marks).
+
+import "fonts/IBMPlexSans-Regular.ttf";
+import "fonts/IBMPlexSans-Medium.ttf";
+import "fonts/IBMPlexSans-SemiBold.ttf";
+import { Palette } from "std-widgets.slint";
+
+// What the big tile at the top communicates. Every value has its own colour,
+// its own glyph and its own word, so it reads without colour vision too.
+export enum Mood { filtering, ready, off, warning, failed, absent, busy }
+
+export global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+
+    // Surfaces.
+    out property <color> window: dark ? #111315 : #eef0f2;
+    out property <color> surface: dark ? #1a1d20 : #ffffff;
+    out property <color> raised: dark ? #23272b : #f5f6f8;
+    out property <color> sunken: dark ? #0b0d0e : #e3e6ea;
+    out property <color> line: dark ? #2e3338 : #d5d9de;
+    out property <color> line-strong: dark ? #4a525a : #9aa3ad;
+
+    // Text. `muted` stays above 4.5:1 on `surface` and on `window`.
+    out property <color> text: dark ? #eceef0 : #14171a;
+    out property <color> muted: dark ? #a3abb4 : #4f5862;
+    out property <color> faint: dark ? #7c858f : #6a737d; // only for non-essential marks
+
+    // Accent: the colour of "suppression is working".
+    out property <color> accent: dark ? #3ccf9a : #0d7a56;
+    out property <color> accent-text: dark ? #04130d : #ffffff; // on `accent`
+    out property <color> accent-soft: dark ? #12392b : #d9f2e7;
+
+    out property <color> warn: dark ? #f2b84b : #8a5300;
+    out property <color> warn-soft: dark ? #3a2c10 : #fdf0d5;
+    out property <color> danger: dark ? #ff7a72 : #b3261e;
+    out property <color> danger-soft: dark ? #3d1716 : #fde4e2;
+    out property <color> info: dark ? #8ab4ff : #1d5bc6;
+
+    // Meter zones, on `sunken`.
+    out property <color> meter-ok: dark ? #3ccf9a : #12a06d;
+    out property <color> meter-hot: dark ? #e7c64a : #d4a514;
+    out property <color> meter-clip: dark ? #ff5a52 : #d93025;
+
+    // Focus ring: one colour, visible on every surface.
+    out property <color> focus: dark ? #8ab4ff : #1d5bc6;
+
+    // Hero tile, per mood: fill, text on it, secondary text on it.
+    public pure function mood-fill(m: Mood) -> color {
+        if m == Mood.filtering { return dark ? #0f6b4c : #0d7a56; }
+        if m == Mood.ready { return dark ? #133a2d : #dcf1e8; }
+        if m == Mood.off { return dark ? #2a2e33 : #dfe3e8; }
+        if m == Mood.warning { return dark ? #4a3510 : #fbe7bd; }
+        if m == Mood.failed { return dark ? #6a1c19 : #b3261e; }
+        if m == Mood.absent { return dark ? #24282c : #e6e9ed; }
+        return dark ? #1f2a3a : #dde7f7;
+    }
+    public pure function mood-text(m: Mood) -> color {
+        if m == Mood.filtering || m == Mood.failed { return #ffffff; }
+        if m == Mood.ready { return dark ? #c9f5e2 : #0a4a35; }
+        if m == Mood.warning { return dark ? #ffe2a8 : #5a3600; }
+        if m == Mood.busy { return dark ? #cfe0ff : #123c86; }
+        return text;
+    }
+    public pure function mood-sub(m: Mood) -> color {
+        if m == Mood.filtering { return #d6f5e8; }
+        if m == Mood.failed { return #ffe1de; }
+        if m == Mood.ready { return dark ? #9fd9c0 : #1d5c46; }
+        if m == Mood.warning { return dark ? #e9cf96 : #6b4300; }
+        if m == Mood.busy { return dark ? #a9c3ee : #2a4f8f; }
+        return muted;
+    }
+
+    // Type.
+    out property <string> family: "IBM Plex Sans";
+    out property <length> size-hero: 30px;
+    out property <length> size-title: 17px;
+    out property <length> size-body: 14px;
+    out property <length> size-small: 12.5px;
+    out property <length> size-tiny: 11px;
+    out property <int> regular: 400;
+    out property <int> medium: 500;
+    out property <int> semibold: 600;
+
+    // Space and shape.
+    out property <length> pad: 20px;
+    out property <length> gap: 12px;
+    out property <length> radius: 14px;
+    out property <length> radius-small: 8px;
+
+    out property <duration> quick: 120ms;
+    out property <duration> settle: 220ms;
+}

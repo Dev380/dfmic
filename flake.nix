@@ -47,19 +47,25 @@
           pkgs.ffmpeg
           pkgs.ladspa-sdk # applyplugin: reference rendering via upstream DeepFilterNet
           pkgs.pkg-config
+          # pipewire-sys and libspa-sys run bindgen, which needs libclang.
+          pkgs.rustPlatform.bindgenHook
           pkgs.pipewire # dev headers for pipewire-rs
           pkgs.fontconfig
           pkgs.freetype
           pkgs.libGL
           pkgs.wayland # libwayland-client for Slint's winit backend
           pkgs.libxkbcommon
-          pkgs.dbus # dev headers for the D-Bus control interface
           pkgs.jq
         ];
         shellHook = ''
           export DFMIC_MODELS=${self.packages.${pkgs.system}.models}
-          # Hand-written PipeWire FFI: the linker needs the .so symlink.
+          # Hand-written OpenVINO FFI, and pipewire-sys links libpipewire
+          # itself: both need the library directories on the native search path.
           export RUSTFLAGS="-L native=${pkgs.pipewire.dev}/lib -L native=${pkgs.openvino.lib}/lib"
+          # Slint's winit backend dlopens these, so nothing records them as a
+          # dependency; without them `cargo run --features gui` dies with
+          # "No default Slint platform was selected".
+          export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [pkgs.wayland pkgs.libxkbcommon pkgs.libGL]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           echo "dfmic: model artifacts at $DFMIC_MODELS"
         '';
       };
@@ -82,9 +88,9 @@
         '';
     });
 
-    nixosModules.default = {
+    nixosModules.default = {pkgs, ...}: {
       imports = [./nix/module.nix];
-      services.dfmic.package = lib.mkDefault self.packages.${nixpkgs.lib.system}.dfmic;
+      services.dfmic.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.dfmic;
     };
 
     formatter = eachSystem (pkgs: pkgs.alejandra);

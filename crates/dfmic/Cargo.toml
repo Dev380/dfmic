@@ -14,10 +14,22 @@ path = "src/main.rs"
 dfn-dsp.workspace = true
 dfn-npu.workspace = true
 num-complex.workspace = true
-slint = { version = "1.19", optional = true }
+# `software-renderer-path` is required for the icon set: the icons are `Path`
+# items, and Slint's software renderer only draws paths with that feature on.
+slint = { version = "1.19", optional = true, features = ["software-renderer-path"] }
+# The virtual microphone, its capture stream and the default-source takeover.
+# `v0_3_50` enables `pw_stream_get_time_n`, which is what reports real latency.
+pipewire = { version = "0.10", features = ["v0_3_50"] }
+# The control interface: the daemon serves it, the CLI and the GUI are clients.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+signal-hook = "0.3"
+libc = "0.2"
 
 [build-dependencies]
-# Only used when the `gui` feature is on; it compiles ui/app.slint to Rust.
+# Only used when the `gui` feature is on; it compiles ui/main.slint to Rust.
 slint-build = { version = "1.19", optional = true }
 
 [features]

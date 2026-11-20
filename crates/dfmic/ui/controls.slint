@@ -1,0 +1,640 @@
+// Hand-built controls: every one is keyboard reachable, shows a focus ring only
+// for keyboard focus, and exposes an accessible role, label and state.
+
+import { Theme } from "theme.slint";
+import { Icon, IconKind } from "icons.slint";
+
+// Keyboard focus ring, drawn around an area of size `target-w` x `target-h`
+// placed at the origin of its parent. Hidden for pointer focus.
+export component FocusRing inherits Rectangle {
+    in property <bool> show;
+    in property <length> radius: Theme.radius-small;
+    in property <length> target-w;
+    in property <length> target-h;
+    x: -3px;
+    y: -3px;
+    width: target-w + 6px;
+    height: target-h + 6px;
+    border-radius: radius + 3px;
+    border-width: show ? 2px : 0px;
+    border-color: Theme.focus;
+    background: transparent;
+}
+
+// A FocusScope that knows whether focus came from the keyboard.
+export component Focusable inherits FocusScope {
+    out property <bool> keyboard-focus: self.has-focus && kb;
+    property <bool> kb;
+    focus-gained(reason) => {
+        kb = reason == FocusReason.tab-navigation || reason == FocusReason.programmatic;
+    }
+    focus-lost => { kb = false; }
+}
+
+export enum ButtonKind { primary, secondary, quiet, danger, on-tile }
+
+export component Button {
+    in property <string> text;
+    in property <ButtonKind> kind: ButtonKind.secondary;
+    in property <bool> enabled: true;
+    in property <bool> small;
+    in property <IconKind> icon;
+    in property <bool> has-icon;
+    in property <color> tile-text: #fff; // for ButtonKind.on-tile
+    callback clicked;
+
+    property <color> fg: !enabled ? Theme.faint
+        : kind == ButtonKind.primary ? Theme.accent-text
+        : kind == ButtonKind.danger ? (Theme.dark ? #1a0505 : #ffffff)
+        : kind == ButtonKind.on-tile ? tile-text
+        : kind == ButtonKind.quiet ? Theme.text
+        : Theme.text;
+    property <color> bg: kind == ButtonKind.primary ? (enabled ? Theme.accent : Theme.raised)
+        : kind == ButtonKind.danger ? (enabled ? Theme.danger : Theme.raised)
+        : kind == ButtonKind.quiet ? transparent
+        : kind == ButtonKind.on-tile ? tile-text.with-alpha(0.14)
+        : Theme.raised;
+
+    min-height: small ? 30px : 36px;
+    min-width: layout.min-width;
+    accessible-role: button;
+    accessible-label: text;
+    accessible-enabled: enabled;
+    accessible-action-default => { if enabled { clicked(); } }
+
+    focus := Focusable {
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if e.text == Key.Space || e.text == Key.Return {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    shape := Rectangle {
+        border-radius: Theme.radius-small;
+        background: touch.pressed && enabled ? bg.darker(0.12)
+            : touch.has-hover && enabled ? (kind == ButtonKind.quiet ? Theme.raised : bg.brighter(Theme.dark ? 0.12 : 0.05))
+            : bg;
+        border-width: kind == ButtonKind.secondary ? 1px : 0px;
+        border-color: Theme.line;
+        animate background { duration: Theme.quick; }
+    }
+    FocusRing { show: focus.keyboard-focus; target-w: root.width; target-h: root.height; }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+
+    layout := HorizontalLayout {
+        padding-left: small ? 10px : 14px;
+        padding-right: small ? 10px : 14px;
+        spacing: 7px;
+        alignment: center;
+        if has-icon: Icon {
+            y: (parent.height - self.height) / 2;
+            kind: icon;
+            color: fg;
+            size: small ? 15px : 17px;
+        }
+        Text {
+            text: root.text;
+            color: fg;
+            font-family: Theme.family;
+            font-size: small ? Theme.size-small : Theme.size-body;
+            font-weight: Theme.medium;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// An on/off switch. `large` is the across-the-room size used on the main tile.
+export component Switch {
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    in property <bool> large;
+    in property <string> label; // accessible name
+    in property <color> on-color: Theme.accent;
+    in property <color> off-color: Theme.line-strong;
+    in property <color> knob-color: #ffffff;
+    in property <color> mark-color: on-color; // the tick on the knob when on
+    callback toggled;
+
+    width: large ? 76px : 44px;
+    height: large ? 42px : 24px;
+    accessible-role: switch;
+    accessible-label: label;
+    accessible-checkable: true;
+    accessible-checked: checked;
+    accessible-enabled: enabled;
+    accessible-action-default => { if enabled { toggled(); } }
+
+    focus := Focusable {
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if e.text == Key.Space || e.text == Key.Return {
+                root.toggled();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    track := Rectangle {
+        border-radius: self.height / 2;
+        background: checked ? on-color : off-color;
+        opacity: enabled ? 1 : 0.45;
+        animate background { duration: Theme.settle; easing: ease-out-quart; }
+    }
+    FocusRing { show: focus.keyboard-focus; radius: root.height / 2; target-w: root.width; target-h: root.height; }
+
+    knob := Rectangle {
+        property <length> inset: large ? 4px : 3px;
+        width: root.height - 2 * inset;
+        height: self.width;
+        y: inset;
+        x: checked ? root.width - self.width - inset : inset;
+        border-radius: self.width / 2;
+        background: knob-color;
+        opacity: enabled ? 1 : 0.7;
+        drop-shadow-blur: 3px;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-color: #00000040;
+        animate x { duration: Theme.settle; easing: ease-out-quart; }
+
+        // A tick on the knob when on, so the state never depends on colour.
+        Icon {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            kind: IconKind.check;
+            size: large ? 20px : 12px;
+            color: mark-color;
+            opacity: checked ? 1 : 0;
+            animate opacity { duration: Theme.quick; }
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.toggled(); }
+    }
+}
+
+// A labelled row with a switch; the whole row is clickable.
+export component SwitchRow {
+    in property <string> title;
+    in property <string> detail;
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    in property <IconKind> icon;
+    callback toggled;
+
+    min-height: layout.min-height;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.toggled(); }
+    }
+    layout := HorizontalLayout {
+        spacing: 14px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        VerticalLayout {
+            alignment: start;
+            padding-top: 1px;
+            Icon { kind: icon; color: enabled ? Theme.muted : Theme.faint; size: 20px; }
+        }
+        VerticalLayout {
+            spacing: 3px;
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: title;
+                color: enabled ? Theme.text : Theme.faint;
+                font-family: Theme.family;
+                font-size: Theme.size-body;
+                font-weight: Theme.medium;
+                wrap: word-wrap;
+            }
+            if detail != "": Text {
+                text: detail;
+                color: enabled ? Theme.muted : Theme.faint;
+                font-family: Theme.family;
+                font-size: Theme.size-small;
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Switch {
+                checked: root.checked;
+                enabled: root.enabled;
+                label: root.title;
+                toggled => { root.toggled(); }
+            }
+        }
+    }
+}
+
+// Two-way choice, e.g. "Full suppression" / "Keep some room".
+export component Segmented {
+    in property <string> left;
+    in property <string> right;
+    in property <bool> right-selected;
+    in property <bool> enabled: true;
+    in property <string> label;
+    callback choose(bool /* right */);
+
+    min-height: 40px;
+    accessible-role: tab-list;
+    accessible-label: label;
+
+    focus := Focusable {
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if e.text == Key.LeftArrow && right-selected { root.choose(false); return accept; }
+            if e.text == Key.RightArrow && !right-selected { root.choose(true); return accept; }
+            if e.text == Key.Space || e.text == Key.Return { root.choose(!right-selected); return accept; }
+            reject
+        }
+    }
+
+    Rectangle {
+        border-radius: Theme.radius-small + 2px;
+        background: Theme.sunken;
+        opacity: enabled ? 1 : 0.5;
+    }
+    FocusRing { show: focus.keyboard-focus; radius: Theme.radius-small + 2px; target-w: root.width; target-h: root.height; }
+
+    pill := Rectangle {
+        x: right-selected ? root.width / 2 : 3px;
+        y: 3px;
+        width: root.width / 2 - 3px;
+        height: root.height - 6px;
+        border-radius: Theme.radius-small;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.line;
+        drop-shadow-blur: 4px;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-color: #0000001f;
+        animate x { duration: Theme.settle; easing: ease-out-quart; }
+    }
+
+    HorizontalLayout {
+        for option[i] in [left, right]: Rectangle {
+            property <bool> selected: (i == 1) == right-selected;
+            accessible-role: tab;
+            accessible-label: option;
+            accessible-checked: selected;
+            accessible-action-default => { if enabled { root.choose(i == 1); } }
+            Text {
+                text: option;
+                color: selected ? Theme.text : Theme.muted;
+                font-family: Theme.family;
+                font-size: Theme.size-body;
+                font-weight: selected ? Theme.semibold : Theme.medium;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: root.enabled ? pointer : default;
+                clicked => {
+                    focus.focus();
+                    root.choose(i == 1);
+                }
+            }
+        }
+    }
+}
+
+// A slider that marks the recommended value and reports changes as they happen.
+// `value` is owned by the caller (the daemon's view of it); while the pointer
+// drags, the slider shows the drag position and reports it through `changed`.
+export component ParamSlider {
+    in property <float> value;
+    in property <float> minimum;
+    in property <float> maximum: 1;
+    in property <float> step: 1;
+    in property <float> default-value;
+    in property <bool> enabled: true;
+    in property <string> label;
+    in property <string> value-text; // accessible value
+    callback changed(float);
+
+    property <float> span: max(maximum - minimum, 0.000001);
+    property <float> shown: touch.pressed ? drag-value : value;
+    property <float> drag-value;
+    property <length> knob-size: 18px;
+    property <length> track-x: knob-size / 2;
+    property <length> track-w: root.width - knob-size;
+
+    pure function snap(v: float) -> float {
+        return clamp(round((v - minimum) / step) * step + minimum, minimum, maximum);
+    }
+    function nudge(steps: float) {
+        root.changed(snap(value + steps * step));
+    }
+
+    height: 30px;
+    accessible-role: slider;
+    accessible-label: label;
+    accessible-value: value-text;
+    accessible-value-minimum: minimum;
+    accessible-value-maximum: maximum;
+    accessible-value-step: step;
+    accessible-enabled: enabled;
+    accessible-action-increment => { nudge(1); }
+    accessible-action-decrement => { nudge(-1); }
+
+    focus := Focusable {
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if e.text == Key.RightArrow || e.text == Key.UpArrow { nudge(1); return accept; }
+            if e.text == Key.LeftArrow || e.text == Key.DownArrow { nudge(-1); return accept; }
+            if e.text == Key.PageUp { nudge(max(1, round(span / step / 10))); return accept; }
+            if e.text == Key.PageDown { nudge(-max(1, round(span / step / 10))); return accept; }
+            if e.text == Key.Home { root.changed(minimum); return accept; }
+            if e.text == Key.End { root.changed(maximum); return accept; }
+            reject
+        }
+    }
+
+    track := Rectangle {
+        x: track-x;
+        y: (root.height - self.height) / 2;
+        width: track-w;
+        height: 6px;
+        border-radius: 3px;
+        background: Theme.sunken;
+
+        Rectangle {
+            x: 0;
+            width: parent.width * (shown - minimum) / span;
+            border-radius: 3px;
+            background: enabled ? Theme.accent : Theme.line-strong;
+        }
+    }
+
+    // The recommended value: a notch that pokes out above and below the track.
+    Rectangle {
+        x: track-x + track-w * (default-value - minimum) / span - 1.5px;
+        y: (root.height - self.height) / 2;
+        width: 3px;
+        height: 16px;
+        border-radius: 1.5px;
+        background: Theme.line-strong;
+    }
+
+    knob := Rectangle {
+        x: track-x + track-w * (shown - minimum) / span - knob-size / 2;
+        y: (root.height - knob-size) / 2;
+        width: knob-size;
+        height: knob-size;
+        border-radius: knob-size / 2;
+        background: enabled ? Theme.surface : Theme.raised;
+        border-width: 2px;
+        border-color: enabled ? Theme.accent : Theme.line-strong;
+        drop-shadow-blur: 3px;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-color: #00000033;
+        FocusRing { show: focus.keyboard-focus; radius: knob-size / 2; target-w: knob-size; target-h: knob-size; }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {
+                focus.focus();
+                root.drag-value = snap(minimum + span * (self.mouse-x - track-x) / track-w);
+                root.changed(root.drag-value);
+            }
+        }
+        moved => {
+            if self.pressed {
+                let v = snap(minimum + span * (self.mouse-x - track-x) / track-w);
+                if v != root.drag-value {
+                    root.drag-value = v;
+                    root.changed(v);
+                }
+            }
+        }
+        double-clicked => { root.changed(default-value); }
+    }
+}
+
+export enum Tone { info, warn, danger, good }
+
+// A message strip with an optional action area (put buttons in as children).
+export component Banner inherits Rectangle {
+    in property <Tone> tone: Tone.info;
+    in property <string> title;
+    in property <string> body;
+    in property <IconKind> icon: tone == Tone.info ? IconKind.info : tone == Tone.good ? IconKind.check : IconKind.warning;
+    // Set to false when the banner has no buttons, so it does not reserve a row.
+    in property <bool> has-actions: true;
+
+    property <color> ink: tone == Tone.danger ? Theme.danger : tone == Tone.warn ? Theme.warn : tone == Tone.good ? Theme.accent : Theme.info;
+    background: tone == Tone.danger ? Theme.danger-soft : tone == Tone.warn ? Theme.warn-soft : tone == Tone.good ? Theme.accent-soft : Theme.raised;
+    border-radius: Theme.radius-small + 2px;
+    border-width: 1px;
+    border-color: ink.with-alpha(0.35);
+    accessible-role: groupbox;
+    accessible-label: title;
+    accessible-description: body;
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: has-actions ? 10px : 0px;
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                alignment: start;
+                Icon { kind: icon; color: ink; size: 20px; }
+            }
+            VerticalLayout {
+                spacing: 3px;
+                horizontal-stretch: 1;
+                if title != "": Text {
+                    text: title;
+                    color: Theme.text;
+                    font-family: Theme.family;
+                    font-size: Theme.size-body;
+                    font-weight: Theme.semibold;
+                    wrap: word-wrap;
+                }
+                if body != "": Text {
+                    text: body;
+                    color: Theme.text;
+                    font-family: Theme.family;
+                    font-size: Theme.size-small;
+                    wrap: word-wrap;
+                }
+            }
+        }
+        HorizontalLayout {
+            padding-left: 32px;
+            spacing: 8px;
+            alignment: start;
+            visible: has-actions;
+            height: has-actions ? self.preferred-height : 0px;
+            @children
+        }
+    }
+}
+
+// Small label chip: device type, "default", "in effect"...
+export component Badge inherits Rectangle {
+    in property <string> text;
+    in property <color> ink: Theme.muted;
+    in property <bool> has-icon;
+    in property <IconKind> icon;
+    border-radius: 6px;
+    background: ink.with-alpha(Theme.dark ? 0.16 : 0.10);
+    min-width: l.min-width;
+    max-width: l.min-width;
+    horizontal-stretch: 0;
+    height: 22px;
+    l := HorizontalLayout {
+        padding-left: 7px;
+        padding-right: 8px;
+        spacing: 4px;
+        if has-icon: Icon {
+            y: (parent.height - self.height) / 2;
+            kind: icon;
+            color: ink;
+            size: 13px;
+        }
+        Text {
+            text: root.text;
+            color: ink;
+            font-family: Theme.family;
+            font-size: Theme.size-tiny;
+            font-weight: Theme.semibold;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// A section: a heading over a single surface. Not a card grid; one per topic.
+export component Section {
+    in property <string> title;
+    in property <string> aside; // right-aligned note next to the title
+    VerticalLayout {
+        spacing: 10px;
+        HorizontalLayout {
+            padding-left: 4px;
+            padding-right: 4px;
+            Text {
+                text: title;
+                color: Theme.text;
+                font-family: Theme.family;
+                font-size: Theme.size-title;
+                font-weight: Theme.semibold;
+                accessible-role: AccessibleRole.text;
+                horizontal-stretch: 0;
+            }
+            if aside != "": Text {
+                text: aside;
+                color: Theme.muted;
+                font-family: Theme.family;
+                font-size: Theme.size-small;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                overflow: elide;
+                min-width: 0px;
+                horizontal-stretch: 1;
+            }
+        }
+        Rectangle {
+            background: Theme.surface;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.line;
+            VerticalLayout {
+                padding-left: 18px;
+                padding-right: 18px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                @children
+            }
+        }
+    }
+}
+
+export component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.line;
+}
+
+// A clickable header that opens and closes a group.
+export component Disclosure {
+    in property <string> title;
+    in property <string> detail;
+    in-out property <bool> open;
+    accessible-role: button;
+    accessible-label: title;
+    accessible-description: detail;
+    accessible-expandable: true;
+    accessible-expanded: open;
+    accessible-action-default => { open = !open; }
+    accessible-action-expand => { open = !open; }
+    min-height: l.min-height;
+
+    focus := Focusable {
+        key-pressed(e) => {
+            if e.text == Key.Space || e.text == Key.Return { open = !open; return accept; }
+            reject
+        }
+    }
+    FocusRing { show: focus.keyboard-focus; target-w: root.width; target-h: root.height; }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { open = !open; }
+    }
+    l := HorizontalLayout {
+        padding-top: 12px;
+        padding-bottom: 12px;
+        spacing: 12px;
+        VerticalLayout {
+            spacing: 3px;
+            horizontal-stretch: 1;
+            Text {
+                text: title;
+                color: Theme.text;
+                font-family: Theme.family;
+                font-size: Theme.size-body;
+                font-weight: Theme.semibold;
+            }
+            if detail != "": Text {
+                text: detail;
+                color: Theme.muted;
+                font-family: Theme.family;
+                font-size: Theme.size-small;
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 20px;
+                height: 20px;
+                Icon {
+                    // Flipped by swapping the glyph: the software renderer has
+                    // no item transforms, so a rotation would not draw at all.
+                    kind: open ? IconKind.chevron-up : IconKind.chevron;
+                    color: Theme.muted;
+                    size: 20px;
+                }
+            }
+        }
+    }
+}

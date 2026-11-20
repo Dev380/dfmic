@@ -31,7 +31,8 @@ pub fn read(path: &Path) -> Result<Wav, String> {
     let mut data: Option<&[u8]> = None;
     while pos + 8 <= buf.len() {
         let id = &buf[pos..pos + 4];
-        let size = u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as usize;
+        let size =
+            u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as usize;
         let body_start = pos + 8;
         let body_end = body_start.saturating_add(size).min(buf.len());
         match id {
@@ -101,7 +102,11 @@ pub fn read(path: &Path) -> Result<Wav, String> {
             }
             data.len() / (4 * channels as usize)
         }
-        (f, b) => return Err(format!("unsupported WAV format {f} with {b} bits per sample")),
+        (f, b) => {
+            return Err(format!(
+                "unsupported WAV format {f} with {b} bits per sample"
+            ))
+        }
     };
     let _ = frames;
 

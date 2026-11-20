@@ -94,10 +94,14 @@ extern "C" {
         output_port: *mut *mut ov_output_const_port_t,
     ) -> ov_status;
 
-    pub fn ov_const_port_get_shape(port: *const ov_output_const_port_t, shape: *mut ov_shape)
-        -> ov_status;
-    pub fn ov_port_get_any_name(port: *const ov_output_const_port_t, name: *mut *mut c_char)
-        -> ov_status;
+    pub fn ov_const_port_get_shape(
+        port: *const ov_output_const_port_t,
+        shape: *mut ov_shape,
+    ) -> ov_status;
+    pub fn ov_port_get_any_name(
+        port: *const ov_output_const_port_t,
+        name: *mut *mut c_char,
+    ) -> ov_status;
     pub fn ov_output_const_port_free(port: *mut ov_output_const_port_t);
     pub fn ov_free(content: *const c_char);
 
@@ -137,7 +141,11 @@ pub struct OvError {
 
 impl std::fmt::Display for OvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OpenVINO call {} failed with status {}", self.what, self.status)
+        write!(
+            f,
+            "OpenVINO call {} failed with status {}",
+            self.what, self.status
+        )
     }
 }
 

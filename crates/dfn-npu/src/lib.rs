@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::ffi::{c_void, CStr};
 use std::path::Path;
 
-use dfn_dsp::{EncoderOutput, ModelRuntime, NB_DF, NB_ERB, DF_ORDER};
+use dfn_dsp::{EncoderOutput, ModelRuntime, DF_ORDER, NB_DF, NB_ERB};
 use num_complex::Complex32;
 
 use crate::ffi::{
@@ -100,27 +100,21 @@ struct Port {
 }
 
 /// Create a tensor over a host buffer and bind it to an infer request input.
-fn set_input(
-    req: *mut ov_infer_request_t,
-    name: &str,
-    dims: &[i64],
-    data: &mut [f32],
-    keep: &mut Vec<*mut ov_tensor_t>,
-) -> Result<(), String> {
+/// Wrap a host buffer in an input tensor. The buffer must outlive the tensor
+/// and must not be resized, which is why this is called once per input in
+/// `Graph::allocate`.
+fn create_input_tensor(dims: &[i64], data: &mut [f32]) -> Result<*mut ov_tensor_t, String> {
     let mut shape = ffi::ov_shape {
         rank: dims.len() as i64,
         dims: std::ptr::null_mut(),
     };
-    ffi::check(
-        "ov_shape_create",
-        unsafe {
-            ffi::ov_shape_create(
-                dims.len() as i64,
-                dims.as_ptr(),
-                &mut shape as *mut _ as *mut ffi::ov_shape_t,
-            )
-        },
-    )?;
+    ffi::check("ov_shape_create", unsafe {
+        ffi::ov_shape_create(
+            dims.len() as i64,
+            dims.as_ptr(),
+            &mut shape as *mut _ as *mut ffi::ov_shape_t,
+        )
+    })?;
     let mut tensor: *mut ov_tensor_t = std::ptr::null_mut();
     let status = unsafe {
         ffi::ov_tensor_create_from_host_ptr(
@@ -132,13 +126,19 @@ fn set_input(
     };
     unsafe { ffi::ov_shape_free(&mut shape as *mut _ as *mut ffi::ov_shape_t) };
     ffi::check("ov_tensor_create_from_host_ptr", status)?;
-    keep.push(tensor);
+    Ok(tensor)
+}
 
+/// Attach an already-created input tensor to the request.
+fn attach_input(
+    req: *mut ov_infer_request_t,
+    name: &str,
+    tensor: *mut ov_tensor_t,
+) -> Result<(), String> {
     let cname = cstring(name);
-    ffi::check(
-        "ov_infer_request_set_tensor",
-        unsafe { ffi::ov_infer_request_set_tensor(req, cname.as_ptr(), tensor) },
-    )
+    ffi::check("ov_infer_request_set_tensor", unsafe {
+        ffi::ov_infer_request_set_tensor(req, cname.as_ptr(), tensor)
+    })
     .map_err(String::from)
 }
 
@@ -153,23 +153,23 @@ fn read_output(
     dest: &mut [f32],
 ) -> Result<(), String> {
     let mut tensor: *mut ov_tensor_t = std::ptr::null_mut();
-    ffi::check(
-        "ov_infer_request_get_output_tensor_by_index",
-        unsafe { ffi::ov_infer_request_get_output_tensor_by_index(req, index, &mut tensor) },
-    )?;
+    ffi::check("ov_infer_request_get_output_tensor_by_index", unsafe {
+        ffi::ov_infer_request_get_output_tensor_by_index(req, index, &mut tensor)
+    })?;
     let mut ptr: *mut c_void = std::ptr::null_mut();
-    ffi::check(
-        "ov_tensor_data",
-        unsafe { ffi::ov_tensor_data(tensor, &mut ptr) },
-    )?;
+    ffi::check("ov_tensor_data", unsafe {
+        ffi::ov_tensor_data(tensor, &mut ptr)
+    })?;
     let mut elems = 0usize;
-    ffi::check(
-        "ov_tensor_get_size",
-        unsafe { ffi::ov_tensor_get_size(tensor, &mut elems) },
-    )?;
+    ffi::check("ov_tensor_get_size", unsafe {
+        ffi::ov_tensor_get_size(tensor, &mut elems)
+    })?;
     let src = unsafe { std::slice::from_raw_parts(ptr as *const f32, elems) };
     if std::env::var("DFMIC_DEBUG_RAW").is_ok() {
-        eprintln!("RAW out[{index}] dims={dims:?} elems={elems} first={:?}", &src[..elems.min(8)]);
+        eprintln!(
+            "RAW out[{index}] dims={dims:?} elems={elems} first={:?}",
+            &src[..elems.min(8)]
+        );
     }
 
     match time_axis {
@@ -201,6 +201,21 @@ pub struct Graph {
     /// Past GRU outputs per state, oldest first, always `frames - 1` long.
     state_hist: Vec<VecDeque<Vec<f32>>>,
     out_buf: Vec<Vec<f32>>,
+    /// Flattened GRU state history, rebuilt in place each hop. Owned here rather
+    /// than allocated per hop because its address must stay put: see
+    /// `in_tensors`.
+    state_flat: Vec<Vec<f32>>,
+    /// Input tensors, created once and reused.
+    ///
+    /// `ov_tensor_create_from_host_ptr` wraps *our* buffer, so a tensor stays
+    /// valid as long as that buffer does not move. Every buffer it points at is
+    /// sized in `allocate` and only ever written in place, so the tensors are
+    /// created there and only re-attached to the request per hop. This removes
+    /// a shape allocation, a tensor allocation and a tensor free for every input
+    /// of every graph, 100 times a second.
+    in_tensors: Vec<*mut ov_tensor_t>,
+    /// Same, for the stacked state-history inputs.
+    state_tensors: Vec<*mut ov_tensor_t>,
     pub infer_count: u64,
 }
 
@@ -235,10 +250,9 @@ impl Graph {
             .map_err(|e| format!("compiling {} on {}: {e}", spec.name, device))?;
 
         let mut req: *mut ov_infer_request_t = std::ptr::null_mut();
-        ffi::check(
-            "ov_compiled_model_create_infer_request",
-            unsafe { ffi::ov_compiled_model_create_infer_request(cm, &mut req) },
-        )?;
+        ffi::check("ov_compiled_model_create_infer_request", unsafe {
+            ffi::ov_compiled_model_create_infer_request(cm, &mut req)
+        })?;
 
         let mut graph = Self {
             cm,
@@ -252,6 +266,9 @@ impl Graph {
             in_hist: Vec::new(),
             state_hist: Vec::new(),
             out_buf: Vec::new(),
+            state_flat: Vec::new(),
+            in_tensors: Vec::new(),
+            state_tensors: Vec::new(),
             infer_count: 0,
         };
         graph.discover_ports()?;
@@ -262,14 +279,12 @@ impl Graph {
     fn discover_ports(&mut self) -> Result<(), String> {
         let mut n_in = 0usize;
         let mut n_out = 0usize;
-        ffi::check(
-            "ov_compiled_model_inputs_size",
-            unsafe { ffi::ov_compiled_model_inputs_size(self.cm, &mut n_in) },
-        )?;
-        ffi::check(
-            "ov_compiled_model_outputs_size",
-            unsafe { ffi::ov_compiled_model_outputs_size(self.cm, &mut n_out) },
-        )?;
+        ffi::check("ov_compiled_model_inputs_size", unsafe {
+            ffi::ov_compiled_model_inputs_size(self.cm, &mut n_in)
+        })?;
+        ffi::check("ov_compiled_model_outputs_size", unsafe {
+            ffi::ov_compiled_model_outputs_size(self.cm, &mut n_out)
+        })?;
 
         for i in 0..n_in {
             self.inputs.push(self.input_port(i)?);
@@ -356,15 +371,13 @@ impl Graph {
     fn port_at(&self, index: usize, output: bool) -> Result<Port, String> {
         let mut port_ptr = std::ptr::null_mut();
         if output {
-            ffi::check(
-                "ov_compiled_model_output_by_index",
-                unsafe { ffi::ov_compiled_model_output_by_index(self.cm, index, &mut port_ptr) },
-            )?;
+            ffi::check("ov_compiled_model_output_by_index", unsafe {
+                ffi::ov_compiled_model_output_by_index(self.cm, index, &mut port_ptr)
+            })?;
         } else {
-            ffi::check(
-                "ov_compiled_model_input_by_index",
-                unsafe { ffi::ov_compiled_model_input_by_index(self.cm, index, &mut port_ptr) },
-            )?;
+            ffi::check("ov_compiled_model_input_by_index", unsafe {
+                ffi::ov_compiled_model_input_by_index(self.cm, index, &mut port_ptr)
+            })?;
         }
         let port = unsafe { read_port(port_ptr) };
         unsafe { ffi::ov_output_const_port_free(port_ptr) };
@@ -411,6 +424,26 @@ impl Graph {
         // Only the newest frame of a windowed output is valid, so the output
         // buffers hold exactly one frame: sizing them for the whole window would
         // hand the next graph a buffer with stale data past the valid block.
+        // Sized once, never resized: these back the cached input tensors.
+        self.state_flat = self
+            .states
+            .iter()
+            .map(|p| vec![0.0f32; p.elems * (self.spec.frames - 1)])
+            .collect();
+        self.in_tensors = self
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| create_input_tensor(&p.dims, &mut self.in_buf[i]))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("creating input tensors");
+        self.state_tensors = self
+            .states
+            .iter()
+            .enumerate()
+            .map(|(i, p)| create_input_tensor(&p.dims, &mut self.state_flat[i]))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("creating state tensors");
         self.out_buf = self
             .outputs
             .iter()
@@ -427,52 +460,55 @@ impl Graph {
 
     /// Push one frame through the graph. `frame` holds one block per feature input.
     fn push(&mut self, frame: &[&[f32]]) -> Result<(), String> {
-        assert_eq!(frame.len(), self.inputs.len(), "{}: frame arity", self.spec.name);
+        assert_eq!(
+            frame.len(),
+            self.inputs.len(),
+            "{}: frame arity",
+            self.spec.name
+        );
 
         for (i, value) in frame.iter().enumerate() {
             self.in_hist[i].pop_front();
             self.in_hist[i].push_back(value.to_vec());
         }
 
-        // Build the windowed feature tensors from the frame histories.
+        // Build the windowed feature tensors from the frame histories. Read the
+        // history in place: cloning it first copied every frame of every input
+        // on every hop, for no reason.
         for i in 0..self.inputs.len() {
             let dims = self.inputs[i].dims.clone();
             let axis = self.spec.input_time_axis[i];
-            let history: Vec<Vec<f32>> = self.in_hist[i].iter().cloned().collect();
-            let mut buf = std::mem::take(&mut self.in_buf[i]);
-            for (t, f) in history.iter().enumerate() {
-                scatter_frame(&mut buf, &dims, axis, t, f);
+            let (buf, hist) = (&mut self.in_buf[i], &self.in_hist[i]);
+            for (t, frame) in hist.iter().enumerate() {
+                scatter_frame(buf, &dims, axis, t, frame);
             }
-            self.in_buf[i] = buf;
         }
 
-        // Stack the GRU state history into its [frames - 1, 1, H] tensor.
-        let mut state_flat: Vec<Vec<f32>> = self
-            .states
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let mut flat = Vec::with_capacity(p.elems * (self.spec.frames - 1));
-                for h in self.state_hist[i].iter() {
-                    flat.extend_from_slice(h);
+        // Stack the GRU state history into its [frames - 1, 1, H] tensor, in
+        // place: the buffer backs a cached tensor, so it must not move.
+        for (i, flat) in self.state_flat.iter_mut().enumerate() {
+            let mut at = 0;
+            for h in self.state_hist[i].iter() {
+                let end = at + h.len();
+                if end > flat.len() {
+                    break;
                 }
-                flat
-            })
-            .collect();
+                flat[at..end].copy_from_slice(h);
+                at = end;
+            }
+        }
 
         let req = self.req;
-        let mut keep: Vec<*mut ov_tensor_t> = Vec::new();
+        // Tensors were built once in `allocate`; only re-attach them. Nothing
+        // here allocates.
         for i in 0..self.inputs.len() {
-            set_input(req, &self.inputs[i].name, &self.inputs[i].dims, &mut self.in_buf[i], &mut keep)?;
+            attach_input(req, &self.inputs[i].name, self.in_tensors[i])?;
         }
         for i in 0..self.states.len() {
-            set_input(req, &self.states[i].name, &self.states[i].dims, &mut state_flat[i], &mut keep)?;
+            attach_input(req, &self.states[i].name, self.state_tensors[i])?;
         }
 
         let status = unsafe { ffi::ov_infer_request_infer(req) };
-        for t in keep {
-            unsafe { ffi::ov_tensor_free(t) };
-        }
         ffi::check("ov_infer_request_infer", status)?;
         self.infer_count += 1;
 
@@ -509,6 +545,16 @@ unsafe impl Send for Graph {}
 impl Drop for Graph {
     fn drop(&mut self) {
         unsafe {
+            // Tensors before the request: they are still attached to it.
+            for tensor in self
+                .in_tensors
+                .drain(..)
+                .chain(self.state_tensors.drain(..))
+            {
+                if !tensor.is_null() {
+                    ffi::ov_tensor_free(tensor);
+                }
+            }
             if !self.req.is_null() {
                 ffi::ov_infer_request_free(self.req);
             }
@@ -524,20 +570,20 @@ unsafe fn read_port(port: *mut ffi::ov_output_const_port_t) -> Result<Port, Stri
         rank: 0,
         dims: std::ptr::null_mut(),
     };
-    ffi::check(
-        "ov_const_port_get_shape",
-        unsafe {
-            ffi::ov_const_port_get_shape(port, &mut shape as *mut _ as *mut ffi::ov_shape_t)
-        },
-    )?;
-    let dims: Vec<i64> = unsafe { std::slice::from_raw_parts(shape.dims, shape.rank as usize) }.to_vec();
+    ffi::check("ov_const_port_get_shape", unsafe {
+        ffi::ov_const_port_get_shape(port, &mut shape as *mut _ as *mut ffi::ov_shape_t)
+    })?;
+    let dims: Vec<i64> =
+        unsafe { std::slice::from_raw_parts(shape.dims, shape.rank as usize) }.to_vec();
     unsafe { ffi::ov_shape_free(&mut shape as *mut _ as *mut ffi::ov_shape_t) };
 
     let mut name_ptr: *mut std::ffi::c_char = std::ptr::null_mut();
     let name = if unsafe { ffi::ov_port_get_any_name(port, &mut name_ptr) } == ffi::OK
         && !name_ptr.is_null()
     {
-        let s = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy().into_owned();
+        let s = unsafe { CStr::from_ptr(name_ptr) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { ffi::ov_free(name_ptr) };
         s
     } else {
@@ -657,19 +703,26 @@ pub fn available_devices() -> Result<Vec<String>, String> {
 }
 
 impl ModelRuntime for NpuRuntime {
-    fn encode(&mut self, feat_erb: &[f32], feat_spec: &[f32]) -> EncoderOutput {
+    fn encode_into(&mut self, feat_erb: &[f32], feat_spec: &[f32], out: &mut EncoderOutput) {
         self.enc
             .push(&[feat_erb, feat_spec])
             .expect("encoder inference failed");
-        EncoderOutput {
-            e0: self.enc.output(0).to_vec(),
-            e1: self.enc.output(1).to_vec(),
-            e2: self.enc.output(2).to_vec(),
-            e3: self.enc.output(3).to_vec(),
-            emb: self.enc.output(4).to_vec(),
-            c0: self.enc.output(5).to_vec(),
-            lsnr: self.enc.output(6)[0],
+        // Copy into the caller's buffers rather than allocating six new ones.
+        let skip = self.enc.output(0).len();
+        out.resize(self.enc.output(4).len(), self.enc.output(5).len(), skip);
+        for (slot, index) in [
+            (&mut out.e0, 0),
+            (&mut out.e1, 1),
+            (&mut out.e2, 2),
+            (&mut out.e3, 3),
+            (&mut out.emb, 4),
+            (&mut out.c0, 5),
+        ] {
+            let src = self.enc.output(index);
+            let n = slot.len().min(src.len());
+            slot[..n].copy_from_slice(&src[..n]);
         }
+        out.lsnr = self.enc.output(6)[0];
     }
 
     fn erb_mask(&mut self, enc: &EncoderOutput) -> [f32; NB_ERB] {
