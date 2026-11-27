@@ -464,7 +464,16 @@ pub fn models_download(models: Option<&std::path::Path>) -> Result<(), String> {
     // established before the download is requested: falling back to a direct
     // download after the daemon has *refused* would quietly write the model
     // somewhere the daemon may not read, and hide the reason it gave.
-    let live = with_proxy(|proxy| proxy.model_present().map(|_| ()).map_err(method_error)).is_ok();
+    // Only when the daemon would write where this invocation asked for. A daemon
+    // is started from a session manager with the login environment, so a caller
+    // that overrode `XDG_DATA_HOME` (or passed `--models`) is describing a
+    // directory the daemon does not read; asking it anyway would put the files
+    // somewhere else and then report success for a path that stayed empty.
+    let daemon_path = with_proxy(|proxy| proxy.model_path().map_err(method_error)).ok();
+    let live = with_proxy(|proxy| proxy.model_present().map(|_| ()).map_err(method_error)).is_ok()
+        && daemon_path.as_deref().is_some_and(|path| {
+            std::path::Path::new(path) == crate::models::download_target(models)
+        });
     if live {
         with_proxy(|proxy| proxy.download_model().map_err(method_error))?;
         // Two bounds, because the two ways this can stall are different: the
@@ -507,6 +516,15 @@ pub fn models_download(models: Option<&std::path::Path>) -> Result<(), String> {
         }
     }
     let dir = crate::models::download_default(models)?;
+    if let Some(path) = daemon_path {
+        if !path.is_empty() && std::path::Path::new(&path) != dir {
+            eprintln!(
+                "dfmic: note: the running daemon reads its model from {path}, which this \
+                 download did not touch; restart it against {} to use what was fetched.",
+                dir.display()
+            );
+        }
+    }
     println!("model ready in {}", dir.display());
     Ok(())
 }
