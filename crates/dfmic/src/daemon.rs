@@ -23,6 +23,7 @@ use crate::proto::{
     Failure, MonitorTarget, Param, State, NODE_DESCRIPTION, NODE_NAME, SOFT_PRESET, SOURCE_DEFAULT,
 };
 use crate::pw::{Bridge, Shared};
+use crate::rtkit;
 use crate::service;
 use crate::settings::{self, DeviceSettings, Settings};
 
@@ -99,23 +100,26 @@ enum WorkerEvent {
 /// ring and clicks, so a shorter tail buys dropout margin, not lower latency:
 /// the queue floor is set by bursty production, not by jitter.
 ///
-/// It needs `CAP_SYS_NICE`, which a NixOS user does not normally have; the
-/// module grants it when `services.dfmic.realtime` is enabled. Priority 40 is
-/// deliberately below PipeWire's own 88, so audio callbacks always preempt us.
+/// Scheduling is granted by RealtimeKit rather than by calling
+/// `pthread_setschedparam` directly: raising a thread to `SCHED_FIFO` needs a
+/// non-zero `RLIMIT_RTPRIO`, and an unprivileged `systemd --user` manager cannot
+/// raise one (a user unit's `LimitRTPRIO=` is accepted and then ignored, because
+/// the manager itself runs at 0). See `rtkit` for why that is not a capability
+/// wrapper and what rtkit requires.
+///
+/// Runs *on* the worker thread, because rtkit promotes the calling thread and by
+/// this point OpenVINO has already spawned threads that inherit its name.
 fn promote_to_realtime() {
-    const PRIORITY: libc::c_int = 40;
-    let param = libc::sched_param {
-        sched_priority: PRIORITY,
-    };
-    let result =
-        unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
-    if result != 0 {
-        // Expected on a default install: say so once, and carry on normally.
-        eprintln!(
-            "dfmic: note: the NPU worker is running at normal priority ({}); \
-             enable services.dfmic.realtime for a shorter worst case",
-            std::io::Error::from_raw_os_error(result)
-        );
+    if rtkit::is_realtime() {
+        return;
+    }
+    match rtkit::promote_current_thread() {
+        Ok(()) => eprintln!("dfmic: the NPU worker has realtime scheduling"),
+        // Expected without rtkit, and from a session that is not active yet.
+        Err(error) => eprintln!(
+            "dfmic: note: the NPU worker is running at normal priority ({error}); \
+             it will work, with a longer worst case"
+        ),
     }
 }
 
@@ -169,6 +173,12 @@ fn worker_loop(
                     pipeline = Some(loaded);
                     shared.request_reprime();
                     last_load_error = None;
+                    // Now that compiling is done, not before: compiling the NPU
+                    // graphs is about half a second of CPU with no blocking in
+                    // it, and `RLIMIT_RTTIME` kills a realtime thread that runs
+                    // that long without yielding. Promoting first meant the
+                    // process was SIGKILLed while loading its own model.
+                    promote_to_realtime();
                     eprintln!("dfmic: model loaded; filtering is available");
                 }
                 Err(error) => {
@@ -283,6 +293,12 @@ fn spawn_worker(
     device: String,
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
+    // The worker starts before the bridge, but is told to wait for it before
+    // touching any of its state. Starting it early is what gives it a thread to
+    // promote: rtkit promotes the *calling* thread, so the request has to come
+    // from the worker itself, and it has to happen before anything else can
+    // change the process's scheduling state.
+    ready: Arc<std::sync::Barrier>,
 ) -> Result<WorkerHandle, String> {
     // Loading happens inside the thread, not here: a missing model is a normal
     // state (the daemon runs and passes audio through), not a startup failure.
@@ -292,7 +308,10 @@ fn spawn_worker(
     let thread = thread::Builder::new()
         .name("dfmic-npu".into())
         .spawn(move || {
-            promote_to_realtime();
+            // The bridge is still starting; wait for it before the loop looks at
+            // any of its state. A barrier rather than a channel: there is
+            // nothing to send, only an ordering to establish.
+            ready.wait();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_loop(None, models, device, shared, config_rx, stop);
             }));
@@ -519,6 +538,25 @@ impl Daemon {
         let initial_source = settings.source.clone().unwrap_or_default();
         let following = initial_source == SOURCE_DEFAULT;
 
+        // rtkit refuses a request from a process whose `RLIMIT_RTTIME` exceeds
+        // its own `RTTimeUSecMax` (200 ms), so the budget has to be in place
+        // before the worker asks. It is also lost once `Bridge::start` has run:
+        // `module-rt` sets it while probing, and an unprivileged process cannot
+        // raise a hard limit back. Both reasons put this here.
+        if let Err(error) = rtkit::reserve_rt_time() {
+            notices.push(format!(
+                "Realtime scheduling is unavailable ({error}); the NPU worker will run at normal priority."
+            ));
+        }
+        let worker_stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let (worker, worker_events, worker_thread) = spawn_worker(
+            options.models.clone(),
+            options.device.clone(),
+            Arc::clone(&shared),
+            Arc::clone(&worker_stop),
+            Arc::clone(&ready),
+        )?;
         let bridge = Bridge::start(
             NODE_NAME,
             NODE_DESCRIPTION,
@@ -529,6 +567,8 @@ impl Daemon {
             (!initial_source.is_empty() && !following).then_some(initial_source.as_str()),
             Arc::clone(&shared),
         )?;
+        // The bridge is up, so the worker may look at it now.
+        ready.wait();
         // Registry and metadata delivery is asynchronous. Wait only for the
         // initial snapshot, never for audio or for the NPU.
         thread::sleep(Duration::from_millis(200));
@@ -604,13 +644,6 @@ impl Daemon {
                 settings::save(&settings)?;
             }
         }
-        let worker_stop = Arc::new(AtomicBool::new(false));
-        let (worker, worker_events, worker_thread) = spawn_worker(
-            options.models.clone(),
-            options.device.clone(),
-            Arc::clone(&shared),
-            Arc::clone(&worker_stop),
-        )?;
         let autostart = if !service::unit_installed() {
             false
         } else {

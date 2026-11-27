@@ -944,7 +944,21 @@ impl Bridge {
         let thread_loop =
             unsafe { pw::thread_loop::ThreadLoopRc::new(Some("dfmic-pipewire"), None) }
                 .map_err(|error| format!("could not create the PipeWire event loop: {error}"))?;
-        let context = pw::context::ContextRc::new(&thread_loop, None)
+        // `libpipewire-module-rt` is refused for this context: it disables
+        // `RLIMIT_RTTIME` for the whole process while it probes for realtime
+        // privileges, and on an unprivileged process the attempt to set the
+        // hard limit back to its default (`-1`, i.e. infinity) fails with
+        // `EPERM`, leaving 0/0. A realtime thread with a zero budget is
+        // SIGKILLed by the kernel on its first slice of CPU, which is what used
+        // to take the whole daemon down the moment the worker was promoted.
+        //
+        // Scheduling is ours to arrange anyway: see `rtkit`, which asks for
+        // exactly the one thread that needs it and leaves the limit alone.
+        // `module.rt` is the module's own condition key, so this skips it without
+        // touching the user's PipeWire configuration.
+        let mut properties = pw::properties::PropertiesBox::new();
+        properties.insert("module.rt", "false");
+        let context = pw::context::ContextRc::new(&thread_loop, Some(properties))
             .map_err(|error| format!("could not create the PipeWire context: {error}"))?;
         thread_loop.start();
 

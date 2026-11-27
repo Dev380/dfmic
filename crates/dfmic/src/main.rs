@@ -13,6 +13,7 @@ mod notifications;
 mod proto;
 mod pw;
 mod replay;
+mod rtkit;
 mod service;
 mod settings;
 mod wav;

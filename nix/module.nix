@@ -52,20 +52,15 @@ in {
       type = lib.types.bool;
       default = true;
       description = ''
-        Give the daemon `CAP_SYS_NICE` so its NPU worker can run at realtime
-        priority (below PipeWire's own audio threads).
+        Let the NPU worker ask RealtimeKit for realtime scheduling (below
+        PipeWire's own audio threads).
 
-        This shortens the worker's worst case from ~50 ms to ~20 ms, which buys
-        margin against dropouts under load. It does not lower latency: the
-        buffering floor comes from bursty hop production, not from jitter.
-        Turning it off only costs that margin.
+        This shortens the worker's worst case, which is what decides whether the
+        output ring starves under load. It does not lower latency: the buffering
+        floor comes from bursty hop production, not from jitter.
 
-        Implemented as a file capability on a wrapper, not as a unit setting.
-        A systemd *user* unit cannot hold `AmbientCapabilities` — the user
-        manager is unprivileged, and the unit fails to start outright with
-        `status=218/CAPABILITIES`. A file capability on an executable survives
-        `execve` regardless of who launches it, so both the service and a
-        plain `dfmic run` in a terminal get it.
+        Needs `security.rtkit.enable`; without it the daemon says so once and
+        runs at normal priority, which still works.
       '';
     };
   };
@@ -77,17 +72,12 @@ in {
     environment.systemPackages = [package];
     systemd.packages = [package];
 
-    # `CAP_SYS_NICE` is what lets the NPU worker ask for realtime priority. A
-    # wrapper is the only way to grant it: `AmbientCapabilities` is ignored (and
-    # fatal) on user units, and `sudo`/`run0` would put the daemon outside the
-    # session bus it needs to serve. `/run/wrappers/bin` comes first in PATH, so
-    # `dfmic run` in a terminal picks this up too.
-    security.wrappers.dfmic = lib.mkIf cfg.realtime {
-      source = "${package}/bin/dfmic";
-      owner = "root";
-      group = "root";
-      capabilities = "cap_sys_nice+ep";
-    };
+    # Realtime scheduling goes through RealtimeKit, which answers "yes" for an
+    # active local session without a prompt. The alternatives do not work: a
+    # capability wrapper makes `CAP_SYS_NICE` ambient in every process that
+    # touches the binary, and a user unit's `LimitRTPRIO=` is accepted by systemd
+    # and then ignored, because the user manager itself runs at 0.
+    security.rtkit.enable = lib.mkIf cfg.realtime true;
 
     # Keep the package's upstream user unit and Install section. This drop-in
     # overrides the argv and PATH, and adds the module-only settings.
@@ -107,11 +97,7 @@ in {
         ""
         (utils.escapeSystemdExecArgs (
           [
-            (
-              if cfg.realtime
-              then "/run/wrappers/bin/dfmic"
-              else "${package}/bin/dfmic"
-            )
+            "${package}/bin/dfmic"
             "run"
             "--device"
             cfg.device
