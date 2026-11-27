@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::zvariant::{DynamicType, OwnedValue, Value};
 
 use crate::proto::{Device, Failure, Levels, MonitorTarget, BUS_NAME, INTERFACE, OBJECT_PATH};
@@ -20,6 +21,14 @@ pub struct Published {
     pub source_available: bool,
     /// The source setting is [`proto::SOURCE_DEFAULT`]: follow the system default.
     pub source_following: bool,
+    /// The model files are on disk, so filtering is possible.
+    pub model_present: bool,
+    /// Where the daemon reads the model from and downloads into.
+    pub model_path: String,
+    /// A model download is in flight.
+    pub model_downloading: bool,
+    /// A download could succeed: a URL exists and the destination is writable.
+    pub model_download_possible: bool,
     pub devices: Vec<Device>,
     pub compute_device: String,
     pub inference_ms: f64,
@@ -47,12 +56,17 @@ impl Published {
     pub fn initial(compute_device: String) -> Self {
         Self {
             state: "starting".into(),
-            enabled: true,
+            // Matches `Settings::default()`: nothing filters until asked.
+            enabled: false,
             listening: false,
             source: String::new(),
             source_description: String::new(),
             source_available: false,
             source_following: false,
+            model_present: false,
+            model_path: String::new(),
+            model_downloading: false,
+            model_download_possible: false,
             devices: Vec::new(),
             compute_device,
             inference_ms: 0.0,
@@ -102,6 +116,12 @@ pub enum Command {
     ResetAll,
     DismissNotices,
     ClearFailure,
+    /// Fetch the model. Never automatic; see the trait docs.
+    DownloadModel,
+    /// Not a request from anyone: a nudge to the event loop that something it
+    /// watches has changed outside it (a PipeWire registry update, a finished
+    /// download, a signal). Carries no reply and is never sent over the bus.
+    Wake,
 }
 
 #[derive(Debug)]
@@ -130,6 +150,20 @@ struct ControlInterface {
     sender: Sender<Request>,
     published: Arc<RwLock<Published>>,
     shared: Arc<Shared>,
+}
+
+/// Nudge the daemon's event loop without asking it for anything.
+///
+/// The loop blocks on this channel rather than polling, so every asynchronous
+/// source of change has to ring this bell: PipeWire's registry and metadata
+/// callbacks, the worker, a finished download, and the signal handler.
+pub fn wake(sender: &Sender<Request>) {
+    let (reply, _) = mpsc::sync_channel(1);
+    // Nobody is waiting for a reply; the loop drops it.
+    let _ = sender.send(Request {
+        command: Command::Wake,
+        reply,
+    });
 }
 
 pub fn request(sender: &Sender<Request>, command: Command) -> Result<Reply, String> {
@@ -224,6 +258,10 @@ impl ControlInterface {
         self.unit(Command::ClearFailure)
     }
 
+    fn download_model(&self) -> zbus::fdo::Result<()> {
+        self.unit(Command::DownloadModel)
+    }
+
     fn levels(&self) -> Levels {
         self.shared.levels()
     }
@@ -261,6 +299,26 @@ impl ControlInterface {
     #[zbus(property)]
     fn source_following(&self) -> bool {
         self.snapshot().source_following
+    }
+
+    #[zbus(property)]
+    fn model_present(&self) -> bool {
+        self.snapshot().model_present
+    }
+
+    #[zbus(property)]
+    fn model_path(&self) -> String {
+        self.snapshot().model_path
+    }
+
+    #[zbus(property)]
+    fn model_downloading(&self) -> bool {
+        self.snapshot().model_downloading
+    }
+
+    #[zbus(property)]
+    fn model_download_possible(&self) -> bool {
+        self.snapshot().model_download_possible
     }
 
     #[zbus(property)]
@@ -385,33 +443,79 @@ const VOLATILE: [&str; 6] = [
 pub struct ControlServer {
     connection: zbus::blocking::Connection,
     published: Arc<RwLock<Published>>,
+    /// Volatile property changes waiting for the next slow publish.
+    pending_volatile: Mutex<HashMap<String, OwnedValue>>,
 }
 
 impl ControlServer {
+    /// Connect and take the bus name, without publishing anything yet.
+    ///
+    /// Split from [`Self::start`] so a second daemon is turned away *before* it
+    /// touches the default source, the PipeWire graph or the NPU: all three are
+    /// shared with the daemon already running.
+    pub fn connect() -> Result<Self, String> {
+        let connection = zbus::blocking::Connection::session()
+            .map_err(|error| format!("could not connect to the session D-Bus: {error}"))?;
+        Ok(Self {
+            connection,
+            published: Arc::new(RwLock::new(Published::initial(String::new()))),
+            pending_volatile: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Take the bus name.
+    ///
+    /// Called *after* [`Self::start`] has exported the interface, never before:
+    /// a name with nothing behind it is worse than no name at all. A client that
+    /// calls during the gap gets no reply and waits for ever — which is what
+    /// happened to the window when it was open before the daemon started, since
+    /// the daemon claimed the name and then spent seconds on PipeWire setup
+    /// before the object existed. Claiming last means the name appearing is the
+    /// signal that the interface is ready.
+    pub fn claim(self) -> Result<Self, String> {
+        // Not `request_name`: zbus's *default* flags are `AllowReplacement |
+        // ReplaceExisting | DoNotQueue`, so a second daemon would take the name
+        // away from the running one and leave it alive but unreachable. Asking
+        // for `DoNotQueue` alone makes the bus answer `Exists`, which zbus turns
+        // into `Error::NameTaken`, and nobody can displace us afterwards.
+        let reply = self
+            .connection
+            .request_name_with_flags(BUS_NAME, RequestNameFlags::DoNotQueue.into())
+            .map_err(|error| {
+                format!("could not own {BUS_NAME} (is another dfmic daemon running?): {error}")
+            })?;
+        if !matches!(
+            reply,
+            RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner
+        ) {
+            return Err(format!(
+                "could not own {BUS_NAME} (is another dfmic daemon running?): {reply:?}"
+            ));
+        }
+        Ok(self)
+    }
+
+    /// Export the control interface and adopt the initial published state.
     pub fn start(
+        self,
         sender: Sender<Request>,
         shared: Arc<Shared>,
         initial: Published,
     ) -> Result<Self, String> {
-        let connection = zbus::blocking::Connection::session()
-            .map_err(|error| format!("could not connect to the session D-Bus: {error}"))?;
-        connection.request_name(BUS_NAME).map_err(|error| {
-            format!("could not own {BUS_NAME} (is another dfmic daemon running?): {error}")
-        })?;
-        let published = Arc::new(RwLock::new(initial));
         let interface = ControlInterface {
             sender,
-            published: Arc::clone(&published),
+            published: Arc::clone(&self.published),
             shared,
         };
-        connection
+        self.connection
             .object_server()
             .at(OBJECT_PATH, interface)
             .map_err(|error| format!("could not export {INTERFACE}: {error}"))?;
-        Ok(Self {
-            connection,
-            published,
-        })
+        *self
+            .published
+            .write()
+            .expect("published state lock poisoned") = initial;
+        Ok(self)
     }
 
     pub fn connection(&self) -> &zbus::blocking::Connection {
@@ -444,6 +548,14 @@ impl ControlServer {
         changed!(source, "Source");
         changed!(source_description, "SourceDescription");
         changed!(source_available, "SourceAvailable");
+        changed!(source_following, "SourceFollowing");
+        // These three were missing from this list, so a model that appeared (or a
+        // download that started) changed the published state without ever
+        // telling a client: the window only found out on its periodic refresh.
+        changed!(model_present, "ModelPresent");
+        changed!(model_path, "ModelPath");
+        changed!(model_downloading, "ModelDownloading");
+        changed!(model_download_possible, "ModelDownloadPossible");
         changed!(devices, "Devices");
         changed!(compute_device, "ComputeDevice");
         changed!(inference_ms, "InferenceMs");
@@ -466,9 +578,19 @@ impl ControlServer {
         changed!(last_failure, "LastFailure");
         *previous = next;
         drop(previous);
+        // Volatile properties are only emitted at the caller's slower cadence, so
+        // a change that arrives on a fast publish has to be carried over rather
+        // than dropped: `previous` has already absorbed it, so nothing would ever
+        // report it again.
+        let mut pending = self
+            .pending_volatile
+            .lock()
+            .expect("pending state lock poisoned");
+        pending.extend(volatile);
         if emit_volatile {
-            immediate.extend(volatile);
+            immediate.extend(pending.drain());
         }
+        drop(pending);
         if !immediate.is_empty() {
             let invalidated: Vec<String> = Vec::new();
             if let Err(error) = self.connection.emit_signal(

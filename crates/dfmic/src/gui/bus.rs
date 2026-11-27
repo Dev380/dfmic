@@ -1,10 +1,15 @@
 //! The window's connection to the daemon.
 //!
-//! Nothing here runs on the UI thread. Three kinds of background work feed the
-//! window:
+//! Nothing here runs on the UI thread, including the connection itself: a slow
+//! or missing session bus delays the first `Link`, never the window. Four kinds
+//! of background work feed the window:
+//!   * a connector that opens the session bus and starts the rest, so that the
+//!     first frame is drawn while it is still connecting;
 //!   * a refresher that reads every property in one `GetAll` whenever the daemon
 //!     says something changed, appears or disappears (and every couple of
-//!     seconds as a safety net), and hands the result to the UI thread;
+//!     seconds as a safety net), and hands the result to the UI thread. The
+//!     `systemctl --user` facts behind it are cached, because the daemon being
+//!     absent is the normal case and each of those is a fork;
 //!   * a level poller that calls the stateless `Levels()` at about 30 Hz while
 //!     the daemon is present;
 //!   * a command runner that performs actions in order and reports failures.
@@ -40,6 +45,12 @@ pub struct Snapshot {
     pub source_available: bool,
     /// The source setting is "default": follow the system default.
     pub source_following: bool,
+    /// The model files are on disk, so filtering is possible.
+    pub model_present: bool,
+    /// A model download is in flight.
+    pub model_downloading: bool,
+    /// A download could succeed at all.
+    pub model_download_possible: bool,
     pub devices: Vec<Device>,
     pub compute_device: String,
     pub inference_ms: f64,
@@ -73,6 +84,80 @@ pub struct Absent {
     pub failure: Option<Failure>,
 }
 
+/// The unit's systemd facts, and when each was asked for.
+///
+/// Every one of them is a `systemctl --user` fork, and the refresher runs
+/// whether or not the daemon exists — which is most of the time, since the
+/// window is designed to work with it absent. Measured with the daemon down, the
+/// uncached refresher forked twice a second for as long as the window was open.
+/// None of these facts change except when this window or the user acts, so a
+/// couple of seconds of staleness is invisible and a fork per fact per refresh
+/// is not.
+///
+/// The TTLs differ because the facts do: `is-active` has to notice a daemon that
+/// is compiling its models, while the unit file and the enablement only change
+/// when someone installs or enables them. Anything that changes either is
+/// invalidated outright through [`changes_systemd`], so the seconds after the
+/// user presses Start are never answered from here.
+#[derive(Default)]
+struct FactCache {
+    facts: Mutex<Facts>,
+}
+
+#[derive(Default)]
+struct Facts {
+    /// `systemctl --user cat`: does the unit exist at all?
+    installed: Option<(Instant, bool)>,
+    /// `systemctl --user is-active`: running or starting, bus name or not.
+    active: Option<(Instant, bool)>,
+    /// `systemctl --user is-enabled`; `None` in the entry means the query failed.
+    autostart: Option<(Instant, Option<bool>)>,
+}
+
+/// How long `is-active` may stand. Long enough that a window left open with the
+/// daemon down costs one fork every two seconds rather than eight.
+const ACTIVE_TTL: Duration = Duration::from_secs(2);
+/// How long the unit file and the enablement may stand: they only change when
+/// the package is reinstalled or someone enables the unit, and both of those go
+/// through the command runner.
+const INSTALLED_TTL: Duration = Duration::from_secs(30);
+
+impl FactCache {
+    fn invalidate(&self) {
+        let mut facts = self.facts.lock().unwrap_or_else(|e| e.into_inner());
+        *facts = Facts::default();
+    }
+
+    /// The facts, re-asked only as often as each is allowed to be stale.
+    ///
+    /// The lock is held across the `systemctl` calls on purpose: the refresher is
+    /// the only caller, and two of them forking the same query is exactly the
+    /// waste this exists to remove.
+    fn take(&self) -> (bool, bool, Option<bool>) {
+        fn is_fresh<T>(taken: Option<(Instant, T)>, now: Instant, ttl: Duration) -> bool {
+            taken.is_some_and(|(at, _)| now.duration_since(at) < ttl)
+        }
+
+        let mut facts = self.facts.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if !is_fresh(facts.installed, now, INSTALLED_TTL) {
+            facts.installed = Some((now, service::unit_installed()));
+        }
+        if !is_fresh(facts.active, now, ACTIVE_TTL) {
+            facts.active = Some((now, service::is_active()));
+        }
+        if !is_fresh(facts.autostart, now, INSTALLED_TTL) {
+            facts.autostart = Some((now, service::autostart_enabled().ok()));
+        }
+        // Each entry was just filled, so the unwraps are on values this call
+        // wrote or on ones already fresh.
+        let installed = facts.installed.map(|(_, v)| v).unwrap_or(false);
+        let active = facts.active.map(|(_, v)| v).unwrap_or(false);
+        let autostart = facts.autostart.and_then(|(_, v)| v);
+        (installed, active, autostart)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Link {
     /// The first look has not completed yet.
@@ -102,6 +187,8 @@ pub enum Command {
     DismissNotices,
     ClearFailure,
     StartService,
+    /// Ask the daemon to fetch the model. It is the only thing that downloads.
+    DownloadModel,
 }
 
 /// A command the daemon (or systemd) refused, in words for the user.
@@ -113,32 +200,88 @@ pub struct Refusal {
 pub struct Handles {
     pub commands: Sender<Command>,
     pub levels: Arc<Mutex<Option<(Instant, Levels)>>>,
+    /// Set by the UI thread: would a level reading change anything on screen?
+    ///
+    /// The poller runs at 30 Hz, and 30 D-Bus round trips a second is real work
+    /// for both processes. It is only worth it while the output meter is actually
+    /// showing something — that is, while the daemon is filtering and something is
+    /// listening — and while the window is on screen. `Levels()` is stateless, so
+    /// not asking costs the daemon nothing either.
+    pub want_levels: Arc<AtomicBool>,
 }
 
 /// Start the background work. `on_link` and `on_refusal` are called from
 /// background threads; they must hand off to the UI thread themselves.
+///
+/// Returns at once: the session bus is connected on a thread of its own, so a
+/// slow or missing bus delays the first `Link`, not the window. The first thing
+/// the UI hears is therefore whatever `on_link` says once the connection has
+/// been tried; until then the view shows its own "Connecting…".
 pub fn start(
     on_link: impl Fn(Link) + Send + Sync + 'static,
     on_refusal: impl Fn(Refusal) + Send + Sync + 'static,
 ) -> Handles {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
     let levels = Arc::new(Mutex::new(None));
+    let want_levels = Arc::new(AtomicBool::new(false));
     let handles = Handles {
         commands: cmd_tx,
         levels: Arc::clone(&levels),
+        want_levels: Arc::clone(&want_levels),
     };
 
+    let present = Arc::new(AtomicBool::new(false));
+    let facts = Arc::new(FactCache::default());
+    // The connect is a socket round trip and can fail on a machine with no bus;
+    // none of that belongs in front of the first paint. If the thread cannot be
+    // spawned at all — a thread table that is already exhausted — the window
+    // still works as well as a bus client can without a connection, so it says
+    // so instead of panicking.
+    if let Err(error) = std::thread::Builder::new()
+        .name("dfmic-connect".into())
+        .spawn(move || {
+            connect(
+                present,
+                facts,
+                levels,
+                want_levels,
+                cmd_rx,
+                on_link,
+                on_refusal,
+            )
+        })
+    {
+        // Reported rather than silently swallowed: the tile will sit on
+        // "Connecting…" for ever, and this is why.
+        eprintln!("dfmic gui: could not spawn the bus connection thread: {error}");
+    }
+    handles
+}
+
+/// Connect to the session bus and start everything that needs it.
+///
+/// Runs on the connection thread: the connect is a socket round trip, and on a
+/// machine with no session bus it is a failure that must not be shown by a
+/// window that never appears.
+fn connect(
+    present: Arc<AtomicBool>,
+    facts: Arc<FactCache>,
+    levels: Arc<Mutex<Option<(Instant, Levels)>>>,
+    want_levels: Arc<AtomicBool>,
+    cmd_rx: Receiver<Command>,
+    on_link: impl Fn(Link) + Send + Sync + 'static,
+    on_refusal: impl Fn(Refusal) + Send + Sync + 'static,
+) {
     let conn = match Connection::session() {
         Ok(c) => c,
         Err(e) => {
             on_link(Link::NoBus(format!("Cannot reach the session bus: {e}")));
             // Still run commands that do not need the bus (starting the service).
-            std::thread::spawn(move || run_commands(None, cmd_rx, &|_| {}, &on_refusal));
-            return handles;
+            run_commands(None, cmd_rx, &|_| {}, &on_refusal);
+            return;
         }
     };
 
-    let present = Arc::new(AtomicBool::new(false));
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
 
     // Wake the refresher on any property change from the daemon...
@@ -168,17 +311,19 @@ pub fn start(
     {
         let conn = conn.clone();
         let present = Arc::clone(&present);
+        let facts = Arc::clone(&facts);
         std::thread::Builder::new()
             .name("dfmic-refresh".into())
-            .spawn(move || refresh_loop(&conn, &present, wake_rx, &on_link))
+            .spawn(move || refresh_loop(&conn, &present, &facts, wake_rx, &on_link))
             .expect("spawning the refresh thread");
     }
     {
         let conn = conn.clone();
         let present = Arc::clone(&present);
+        let want_levels = Arc::clone(&want_levels);
         std::thread::Builder::new()
             .name("dfmic-levels".into())
-            .spawn(move || levels_loop(&conn, &present, &levels))
+            .spawn(move || levels_loop(&conn, &present, &want_levels, &levels))
             .expect("spawning the level thread");
     }
     {
@@ -186,14 +331,26 @@ pub fn start(
         std::thread::Builder::new()
             .name("dfmic-commands".into())
             .spawn(move || {
-                let wake = move |_: &Command| {
+                let wake = move |command: &Command| {
+                    if changes_systemd(command) {
+                        // The answer the cache holds is now known to be wrong.
+                        facts.invalidate();
+                    }
                     let _ = wake_tx.send(());
                 };
                 run_commands(Some(&conn), cmd_rx, &wake, &on_refusal)
             })
             .expect("spawning the command thread");
     }
-    handles
+}
+
+/// Whether a command can change what `systemctl --user` would answer.
+///
+/// These two are the reason the cache can be trusted for long: the window is
+/// the only thing that starts the unit or changes autostart, and when it does,
+/// it says so here instead of waiting out the TTL.
+fn changes_systemd(command: &Command) -> bool {
+    matches!(command, Command::StartService | Command::SetAutostart(_))
 }
 
 fn spawn_signal_watch(conn: &Connection, rule: zbus::Result<MatchRule<'static>>, wake: Sender<()>) {
@@ -221,6 +378,7 @@ fn spawn_signal_watch(conn: &Connection, rule: zbus::Result<MatchRule<'static>>,
 fn refresh_loop(
     conn: &Connection,
     present: &AtomicBool,
+    facts: &FactCache,
     wake: Receiver<()>,
     on_link: &(dyn Fn(Link) + Send + Sync),
 ) {
@@ -238,10 +396,13 @@ fn refresh_loop(
     };
 
     loop {
-        let link = look(&bus, &props);
+        let link = look(&bus, &props, facts);
         present.store(matches!(link, Link::Present(_)), Ordering::SeqCst);
         // While absent there are no signals to wait for besides the name
         // appearing, but systemd's view (starting, autostart) can still change.
+        // The wait only decides when to *look* again: the systemd facts behind
+        // it are cached for longer (see [`FactCache`]), so this cadence costs one
+        // D-Bus round trip, not four forks.
         let period = if matches!(link, Link::Present(_)) {
             Duration::from_secs(3)
         } else {
@@ -261,7 +422,7 @@ fn refresh_loop(
     }
 }
 
-fn look(bus: &DBusProxy<'_>, props: &PropertiesProxy<'_>) -> Link {
+fn look(bus: &DBusProxy<'_>, props: &PropertiesProxy<'_>, facts: &FactCache) -> Link {
     let owned = proto::BUS_NAME
         .try_into()
         .map_err(|e: zbus::names::Error| e.to_string())
@@ -272,19 +433,23 @@ fn look(bus: &DBusProxy<'_>, props: &PropertiesProxy<'_>) -> Link {
             // The daemon vanished between the two calls, or is mid-start.
             Err(e) => {
                 eprintln!("dfmic gui: reading daemon state: {e}");
-                Link::Absent(absent())
+                Link::Absent(absent(facts))
             }
         },
-        Ok(false) => Link::Absent(absent()),
+        Ok(false) => Link::Absent(absent(facts)),
         Err(e) => Link::NoBus(e),
     }
 }
 
-fn absent() -> Absent {
+fn absent(facts: &FactCache) -> Absent {
+    let (unit_installed, unit_active, autostart) = facts.take();
     Absent {
-        unit_installed: service::unit_installed(),
-        unit_active: service::is_active(),
-        autostart: service::autostart_enabled().ok(),
+        unit_installed,
+        unit_active,
+        autostart,
+        // Not cached: the file is written by a daemon that is not on the bus, and
+        // a read of a small file costs nothing next to a point of truth that has
+        // to be current the moment the daemon dies.
         failure: service::last_failure(),
     }
 }
@@ -311,6 +476,9 @@ fn read_snapshot(props: &PropertiesProxy<'_>) -> Result<Snapshot, String> {
         source_description: take(&mut m, "SourceDescription")?,
         source_available: take(&mut m, "SourceAvailable")?,
         source_following: take(&mut m, "SourceFollowing")?,
+        model_present: take(&mut m, "ModelPresent")?,
+        model_downloading: take(&mut m, "ModelDownloading")?,
+        model_download_possible: take(&mut m, "ModelDownloadPossible")?,
         devices: take(&mut m, "Devices")?,
         compute_device: take(&mut m, "ComputeDevice")?,
         inference_ms: take(&mut m, "InferenceMs")?,
@@ -340,7 +508,12 @@ fn control(conn: &Connection) -> zbus::Result<ControlProxyBlocking<'static>> {
         .build()
 }
 
-fn levels_loop(conn: &Connection, present: &AtomicBool, slot: &Mutex<Option<(Instant, Levels)>>) {
+fn levels_loop(
+    conn: &Connection,
+    present: &AtomicBool,
+    want_levels: &AtomicBool,
+    slot: &Mutex<Option<(Instant, Levels)>>,
+) {
     let proxy = match control(conn) {
         Ok(p) => p,
         Err(e) => {
@@ -348,10 +521,16 @@ fn levels_loop(conn: &Connection, present: &AtomicBool, slot: &Mutex<Option<(Ins
             return;
         }
     };
-    let period = Duration::from_millis(33);
+    /// While the window is on screen: one poll per frame.
+    const FRAME: Duration = Duration::from_millis(33);
+    /// While it is not: slow enough to cost nothing, quick enough that the meters
+    /// are alive again within a couple of frames of the window coming back.
+    const IDLE: Duration = Duration::from_millis(500);
     loop {
         let started = Instant::now();
-        if present.load(Ordering::SeqCst) {
+        let wanted = want_levels.load(Ordering::Relaxed);
+        let period = if wanted { FRAME } else { IDLE };
+        if wanted && present.load(Ordering::SeqCst) {
             // A failed call means the daemon is going away; the refresher sees
             // that through NameOwnerChanged, and the meters go stale on their own.
             if let Ok(levels) = proxy.levels() {
@@ -442,6 +621,7 @@ fn execute(proxy: Option<&ControlProxyBlocking<'_>>, command: &Command) -> Resul
         Command::ResetAll => proxy.reset_all(),
         Command::DismissNotices => proxy.dismiss_notices(),
         Command::ClearFailure => proxy.clear_failure(),
+        Command::DownloadModel => proxy.download_model(),
         Command::StartService => unreachable!("handled above"),
     };
     result.map_err(describe)

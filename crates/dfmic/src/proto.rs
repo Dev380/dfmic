@@ -45,7 +45,10 @@ pub const UNIT: &str = "dfmic.service";
 /// What the daemon is doing right now. Exposed as the `State` string property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// Compiling models / bringing the streams up. Nothing is exported yet.
+    /// Bringing the streams up and loading the NPU. The interface is already
+    /// exported and the bus name already owned (both happen first, so a client
+    /// never sees a name with nothing behind it), but no device list has been
+    /// read yet.
     Starting,
     /// Enabled, and at least one application (or the self-monitor) is
     /// recording from the virtual microphone: audio is going through the NPU.
@@ -62,6 +65,10 @@ pub enum State {
     /// the device comes back, or when the user picks another. It never falls
     /// back to a different device on its own.
     NoDevice,
+    /// The model has not been downloaded yet. The daemon runs normally — it owns
+    /// the bus name, lists devices and keeps the node up — but it cannot filter,
+    /// so audio passes through untouched until `DownloadModel()` is called.
+    NoModel,
 }
 
 impl State {
@@ -72,6 +79,7 @@ impl State {
             State::Idle => "idle",
             State::Off => "off",
             State::NoDevice => "no-device",
+            State::NoModel => "no-model",
         }
     }
 
@@ -82,6 +90,7 @@ impl State {
             "idle" => State::Idle,
             "off" => State::Off,
             "no-device" => State::NoDevice,
+            "no-model" => State::NoModel,
             _ => return None,
         })
     }
@@ -150,8 +159,9 @@ pub struct Levels {
     pub output_clip: bool,
     /// Gain the AGC is currently applying, in dB (0 when AGC is off or bypassed).
     pub agc_gain_db: f64,
-    /// The model's voice-activity decision for the window (local SNR above the
-    /// AGC gate). False whenever the filter is not running.
+    /// The AGC's gate was open in the window: the input is above the tracked
+    /// room floor and the model has not zero-masked the frame. False whenever
+    /// the filter is not running.
     pub voice: bool,
 }
 
@@ -173,7 +183,9 @@ pub struct ParamSpec {
     pub key: &'static str,
     pub min: f64,
     pub max: f64,
-    /// Smallest meaningful increment; values are rounded to it.
+    /// Smallest meaningful increment, for a client's spinner or slider. Values are
+    /// *not* rounded to it: `SetParam` rejects out-of-range and non-integral
+    /// `min-buffer`/`mask-reduce`, and stores anything else as given.
     pub step: f64,
     /// libDF's recommended value.
     pub default: f64,
@@ -320,6 +332,12 @@ pub trait Control {
     fn dismiss_notices(&self) -> zbus::Result<()>;
     /// Forget `LastFailure` (in memory and on disk).
     fn clear_failure(&self) -> zbus::Result<()>;
+    /// Fetch the model into the data directory.
+    ///
+    /// Never automatic: this is the only way the daemon touches the network.
+    /// Returns at once; `ModelDownloading` reports progress and `ModelPresent`
+    /// the outcome. Downloading an already-present model is a no-op.
+    fn download_model(&self) -> zbus::Result<()>;
     fn levels(&self) -> zbus::Result<Levels>;
 
     // ------------------------------------------------------------- properties
@@ -343,6 +361,25 @@ pub trait Control {
     /// The source setting is [`SOURCE_DEFAULT`]: follow the system default.
     #[zbus(property)]
     fn source_following(&self) -> zbus::Result<bool>;
+
+    /// The model files are on disk, so filtering is possible.
+    #[zbus(property)]
+    fn model_present(&self) -> zbus::Result<bool>;
+    /// The directory the daemon reads the model from and downloads into.
+    ///
+    /// Reported rather than assumed: `--models`, `DFMIC_MODELS` and the data
+    /// directory are three different answers, and a client that guesses prints a
+    /// path the files are not in.
+    #[zbus(property)]
+    fn model_path(&self) -> zbus::Result<String>;
+    /// A `DownloadModel()` is in flight.
+    #[zbus(property)]
+    fn model_downloading(&self) -> zbus::Result<bool>;
+    /// `DownloadModel()` could succeed: this build knows where to fetch from and
+    /// the destination is writable. False means offering a button would be a
+    /// dead end, so clients should explain instead.
+    #[zbus(property)]
+    fn model_download_possible(&self) -> zbus::Result<bool>;
     /// Live list, updated on hot-plug.
     #[zbus(property)]
     fn devices(&self) -> zbus::Result<Vec<Device>>;

@@ -8,6 +8,7 @@
 
 mod bus;
 mod meters;
+mod micmeter;
 mod record;
 
 use std::cell::RefCell;
@@ -33,10 +34,28 @@ const LEVELS_STALE: Duration = Duration::from_millis(400);
 /// jumps in eighth-of-a-second steps looks broken, so the rate stays fixed and
 /// the cost is taken out of the renderer instead (see `select_renderer`).
 const METER_FRAME: Duration = Duration::from_millis(33);
+/// Cadence while the window is hidden or minimised.
+///
+/// Slow enough to cost nothing, quick enough that the meters are alive again
+/// within a couple of frames of the window coming back.
+const HIDDEN_FRAME: Duration = Duration::from_millis(250);
 const TOAST_TIME: Duration = Duration::from_secs(5);
 const TOAST_TIME_WITH_ACTION: Duration = Duration::from_secs(9);
+/// How long a take runs before it stops itself.
+///
+/// A take is two live recordings with no end but the button, and a window that
+/// is left on the record button should not fill the disk. Thirty seconds is far
+/// more than a comparison needs (three of them fit in one 11 MB take) and short
+/// enough to be a backstop rather than a limit.
+const TAKE_LIMIT: Duration = Duration::from_secs(30);
 /// Above this share of the 10 ms budget the NPU is flagged as struggling.
 const NPU_STRAIN_MS: f64 = 8.0;
+/// How long before a microphone capture that is not running is retried.
+///
+/// The meter timer asks every frame whether the capture is alive; a device that
+/// cannot be opened would otherwise be forked thirty times a second for as long
+/// as the window is open. Once per second still notices a microphone coming back.
+const MIC_RETRY: Duration = Duration::from_secs(1);
 
 pub fn run() -> Result<(), String> {
     // The app id is stored on the platform context, which only exists once a
@@ -64,6 +83,7 @@ pub fn run() -> Result<(), String> {
         },
     );
     view.borrow_mut().commands = Some(handles.commands);
+    view.borrow_mut().want_levels = std::sync::Arc::clone(&handles.want_levels);
     wire_callbacks(&window);
     // Fixed for the life of the binary: ranges, defaults and the soft preset.
     let ui = window.global::<Ui>();
@@ -85,8 +105,9 @@ pub fn run() -> Result<(), String> {
     // Meters: a steady 30 fps on the UI thread, reading whatever the poller
     // fetched last. Properties only change (and the window only redraws) when
     // the picture actually moves.
-    let meter_timer = Timer::default();
+    let meter_timer = Rc::new(Timer::default());
     {
+        let timer = Rc::clone(&meter_timer);
         let levels = handles.levels;
         let mut last = Instant::now();
         meter_timer.start(TimerMode::Repeated, METER_FRAME, move || {
@@ -99,11 +120,19 @@ pub fn run() -> Result<(), String> {
                 .and_then(|slot| *slot)
                 .filter(|(at, _)| now.duration_since(*at) < LEVELS_STALE)
                 .map(|(_, l)| l);
-            with_view(|v| {
+            let visible = with_view_r(|v| {
                 v.poll_recorder();
                 v.poll_playback();
-                v.tick_meters(now, dt, sample);
-            });
+                v.tick_meters(now, dt, sample)
+            })
+            .unwrap_or(false);
+            // Back off while there is no window to draw: this tick still has to
+            // run to notice the window coming back, but there is no reason to do
+            // it thirty times a second.
+            let period = if visible { METER_FRAME } else { HIDDEN_FRAME };
+            if timer.interval() != period {
+                timer.set_interval(period);
+            }
         });
     }
 
@@ -184,16 +213,20 @@ fn existing_take() -> Option<std::path::PathBuf> {
 }
 
 fn with_view(f: impl FnOnce(&mut View)) {
+    let _ = with_view_r(f);
+}
+
+/// [`with_view`], for callers that need an answer back.
+fn with_view_r<R>(f: impl FnOnce(&mut View) -> R) -> Option<R> {
     let view = VIEW.with(|slot| slot.borrow().as_ref().and_then(|w| w.upgrade()));
-    if let Some(view) = view {
-        f(&mut view.borrow_mut());
-    }
+    view.map(|view| f(&mut view.borrow_mut()))
 }
 
 fn wire_callbacks(window: &MainWindow) {
     let ui = window.global::<Ui>();
     ui.on_toggle(|| with_view(|v| v.toggle()));
     ui.on_start_service(|| with_view(|v| v.start_service()));
+    ui.on_download_model(|| with_view(|v| v.download_model()));
     ui.on_set_param(|index, value| with_view(|v| v.set_param(index as usize, value as f64)));
     ui.on_reset_param(|index| {
         with_view(|v| {
@@ -262,6 +295,19 @@ impl Flag {
     }
 }
 
+/// The AGC badges, when the AGC is measured at all.
+///
+/// The daemon only meters while it is filtering *and* something is pulling the
+/// node, so both badges mean nothing outside that window. `None` is rendered as
+/// an unknown ("—") rather than as "0.0 dB / No voice", which would claim the
+/// gain is doing nothing exactly when it is not running.
+#[derive(PartialEq)]
+struct AgcView {
+    readout: SharedString,
+    active: bool,
+    voice: bool,
+}
+
 /// A value shown before the daemon has confirmed it.
 struct Pending<T> {
     value: T,
@@ -298,14 +344,35 @@ struct View {
 
     input: Ballistics,
     output: Ballistics,
-    last_meters: Option<(MeterView, MeterView, SharedString, bool, bool)>,
+    /// The last meter picture put on screen. The AGC part is `None` while the
+    /// AGC is not being measured, which is drawn as an unknown, not as zero.
+    last_meters: Option<(MeterView, MeterView, Option<AgcView>)>,
 
     toast_action: Option<ToastAction>,
     toast_timer: Timer,
+    /// The window's own capture of the physical microphone, for the input
+    /// meter. The daemon deliberately does not meter its input.
+    meter: Option<micmeter::MicMeter>,
+    /// Shared with the level poller: whether a level reading could change
+    /// anything on screen.
+    want_levels: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// A take in progress. The window owns it: the daemon is not involved.
     recorder: Option<record::Recorder>,
+    /// When the running take started, so it can be cut off at [`TAKE_LIMIT`].
+    take_started: Option<Instant>,
+    /// A take that has been asked to stop. The reaper thread sends the directory
+    /// once both `pw-record` children have gone, which is when the files are
+    /// complete and can be played.
+    pending_take: Option<std::sync::mpsc::Receiver<std::path::PathBuf>>,
     /// Where the last take was written, so it can be played back.
     take_dir: Option<std::path::PathBuf>,
+    /// The device a capture was last asked for, and when it may be asked again.
+    ///
+    /// A microphone that cannot be opened (no `pw-record`, a node that has just
+    /// gone away) or a capture that dies as soon as it starts must not be
+    /// restarted on every frame: the meter timer runs at 30 Hz, and one forked
+    /// `pw-record` per frame is worse than no meter at all.
+    mic_retry: Option<(String, Instant)>,
     /// The comparison track being played, if any. The child is polled by the
     /// meter timer: `pw-play` exits when the file ends, which is the only
     /// signal needed to put the buttons back.
@@ -327,8 +394,13 @@ impl View {
             last_meters: None,
             toast_action: None,
             toast_timer: Timer::default(),
+            meter: None,
+            want_levels: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             recorder: None,
+            take_started: None,
+            pending_take: None,
             take_dir: existing_take(),
+            mic_retry: None,
             playing: None,
         }
     }
@@ -362,6 +434,7 @@ impl View {
         }
         self.link = link;
         self.settle_pending();
+        self.sync_mic_meter();
         self.render();
     }
 
@@ -383,10 +456,35 @@ impl View {
             }
             Command::SetSource(_) => self.source = None,
             Command::StartService => self.starting = false,
-            Command::ResetParams
-            | Command::ResetAll
-            | Command::DismissNotices
-            | Command::ClearFailure => {}
+            Command::DownloadModel => {}
+            Command::ResetParams => {
+                // The reset put every parameter at its default on screen. A
+                // refusal means the daemon never took that, so the display falls
+                // back to the daemon's own values now instead of at the end of
+                // `PENDING_DEADLINE`. Entries a later drag installed are left
+                // alone: the refusal is about the reset, not about what came
+                // after it.
+                self.params.retain(|i, p| {
+                    PARAMS
+                        .get(*i)
+                        .is_none_or(|spec| (p.value - spec.default).abs() >= spec.step / 2.0)
+                });
+                // Reset also turns soft mode off, so an optimistic "off" came
+                // from the same refused command.
+                if self.flags.get(&Flag::Soft).is_some_and(|p| !p.value) {
+                    self.flags.remove(&Flag::Soft);
+                }
+            }
+            Command::ResetAll => {
+                // Reset All drops every override to show the daemon's published
+                // state; a refusal must leave nothing optimistic behind for it to
+                // hide behind, so the same overrides go now. Autostart is not part
+                // of the reset, so its own pending value stays.
+                self.flags.retain(|flag, _| *flag == Flag::Autostart);
+                self.params.clear();
+                self.source = None;
+            }
+            Command::DismissNotices | Command::ClearFailure => {}
         }
         self.show_toast(refusal.message, None);
         self.render();
@@ -551,9 +649,72 @@ impl View {
     // ----------------------------------------------------------- comparison
 
     /// Record raw and filtered audio so they can be compared after the fact.
+    /// Start, retarget or stop the window's own microphone capture.
+    ///
+    /// Only while the daemon is present: without it there is nothing to meter,
+    /// and the device list is unknown.
+    fn sync_mic_meter(&mut self) {
+        // Without a daemon there is no device list, but there is still a
+        // microphone: the system default. Capturing that keeps the input meter
+        // working when the daemon is down, which is exactly when someone is most
+        // likely to be looking at it and wondering whether the mic works at all.
+        let wanted = match self.snapshot() {
+            Some(s) if s.source_available => s.source.clone(),
+            // The daemon is up and its microphone is gone. There is nothing
+            // honest to capture: the system default may be DeepFilter Mic
+            // itself, and metering the filtered output as "the microphone"
+            // would show the wrong signal under the wrong name. The bar says
+            // "Unavailable" until the device comes back.
+            Some(_) => {
+                self.meter = None;
+                return;
+            }
+            None => String::new(),
+        };
+        // A capture on the wanted device that is still running: nothing to do.
+        if self
+            .meter
+            .as_mut()
+            .is_some_and(|m| m.target() == wanted && m.alive())
+        {
+            return;
+        }
+        // Same device again, and a recent attempt at it: wait rather than fork.
+        // A different device is a choice the user just made, so it is acted on
+        // at once.
+        let now = Instant::now();
+        if self
+            .mic_retry
+            .as_ref()
+            .is_some_and(|(target, at)| *target == wanted && now < *at)
+        {
+            return;
+        }
+        // An empty target is not "nothing to capture": it is the default source.
+        self.meter = micmeter::MicMeter::start(&wanted);
+        self.mic_retry = Some((wanted, now + MIC_RETRY));
+    }
+
+    /// Ask the daemon to fetch the model.
+    ///
+    /// The window never downloads: the daemon owns the data directory, decides
+    /// whether a download is possible, and reports progress through
+    /// `ModelDownloading`, so there is one implementation and one place the
+    /// files can land.
+    fn download_model(&mut self) {
+        let Some(s) = self.snapshot() else {
+            return;
+        };
+        if s.model_downloading || s.model_present {
+            return;
+        }
+        self.send(Command::DownloadModel);
+        self.render();
+    }
+
     /// Start a take, or end the running one.
     ///
-    /// A take stops by itself after a few seconds, but the button stays useful
+    /// A take stops by itself after [`TAKE_LIMIT`], but the button stays useful
     /// while it runs: stopping early keeps everything captured so far.
     fn toggle_recording(&mut self) {
         if self.recorder.is_some() {
@@ -575,7 +736,15 @@ impl View {
         }
         let target = s.source.clone();
         match record::Recorder::start(&target, &record::take_dir()) {
-            Ok(recorder) => self.recorder = Some(recorder),
+            Ok(recorder) => {
+                self.recorder = Some(recorder);
+                self.take_started = Some(Instant::now());
+                // The take being started is overwriting the files of the one
+                // before it, so what is on disk is no longer playable. The
+                // reaper of this take puts the directory back once the files are
+                // final.
+                self.take_dir = None;
+            }
             Err(error) => self.show_toast(error, None),
         }
         self.render();
@@ -584,8 +753,14 @@ impl View {
     /// End the take and keep what was captured.
     fn stop_recording(&mut self) {
         if let Some(recorder) = self.recorder.take() {
-            self.take_dir = Some(recorder.stop());
+            let (tx, rx) = std::sync::mpsc::channel();
+            // A reaper from an earlier take may still be running; its files have
+            // since been overwritten by this one, so its receiver is dropped and
+            // its send fails harmlessly. Both reapers send the same directory.
+            self.pending_take = Some(rx);
+            recorder.stop(tx);
         }
+        self.take_started = None;
         self.render();
     }
 
@@ -607,7 +782,10 @@ impl View {
             Some(_) => self.stop_playback(),
             None => {}
         }
-        if self.recorder.is_some() {
+        if self.recorder.is_some() || self.pending_take.is_some() {
+            // A capture is running, or one has just been stopped and its files
+            // are still being written: playing either would be playing a file
+            // that is not finished.
             return;
         }
         let Some(dir) = self.take_dir.clone() else {
@@ -636,14 +814,49 @@ impl View {
 
     /// Retire a finished player, and a take whose capture stopped on its own.
     fn poll_recorder(&mut self) {
+        // A finished take becomes playable only once its children have exited:
+        // until then the WAV headers are still being written.
+        if let Some(pending) = &self.pending_take {
+            match pending.try_recv() {
+                Ok(dir) => {
+                    self.take_dir = Some(dir);
+                    self.pending_take = None;
+                    self.render();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                // The reaper is gone without a directory: its thread panicked, or
+                // the recorder could not be handed one. Nothing will ever arrive
+                // on this channel, so it must not be waited on for the rest of
+                // the session; the files themselves are still on disk (the
+                // children were interrupted before the thread was spawned).
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.pending_take = None;
+                    self.take_dir = existing_take();
+                    self.show_toast(
+                        format!(
+                            "The recording could not be finished properly. Anything it saved is \
+                             in {}.",
+                            record::take_dir().display()
+                        ),
+                        None,
+                    );
+                    self.render();
+                }
+            }
+        }
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
         // A child exits by itself only when its node went away (the microphone
         // was unplugged, or the daemon stopped exporting), so the take cannot
-        // continue: keep what was recorded rather than recording nothing.
-        let dead = match self.recorder.as_mut() {
-            Some(recorder) => !recorder.alive(),
-            None => return,
-        };
-        if dead {
+        // continue: keep what was recorded rather than recording nothing. A take
+        // that has run its full length is stopped the same way, so nothing is
+        // left recording when the window is walked away from.
+        let finished = !recorder.alive()
+            || self
+                .take_started
+                .is_some_and(|started| started.elapsed() >= TAKE_LIMIT);
+        if finished {
             self.stop_recording();
         }
     }
@@ -720,23 +933,71 @@ impl View {
 
     // ------------------------------------------------------------- meters
 
-    fn tick_meters(&mut self, now: Instant, dt: f32, levels: Option<proto::Levels>) {
+    /// Advance the meters by one frame.
+    ///
+    /// Returns whether the window is worth drawing at. When it is not — hidden or
+    /// minimised — the caller backs the timer off, which is the difference
+    /// between a background window costing nothing and it costing a few percent
+    /// of a core for numbers nobody is reading.
+    fn tick_meters(&mut self, now: Instant, dt: f32, levels: Option<proto::Levels>) -> bool {
         let Some(window) = self.window.upgrade() else {
-            return;
+            return false;
         };
+        // Nobody is looking. `is_visible` is false when the window is hidden or
+        // minimised; occlusion is handled further down by the renderer, which
+        // skips the draw. What is left is our own work, and the microphone
+        // capture this window runs for the input meter — neither of which is
+        // worth anything when there is no window to put the numbers in.
+        // Two independent reasons to stop: the window is not on screen at all, or
+        // it is but the meters are scrolled out of view. Both mean a repaint
+        // would change nothing anyone can see.
+        let on_screen = window.window().is_visible() && window.get_meters_on_screen();
+        self.want_levels
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if !on_screen {
+            self.meter = None;
+            if self.last_meters.is_some() {
+                // Draw the meters to the floor once, so a window that comes back
+                // does not show a stale level held from before it was hidden.
+                // Only the levels: a clip that latched stays latched until it is
+                // reset, because scrolling the card out of view is not the user
+                // acknowledging a clipped microphone.
+                self.input.reset_levels();
+                self.output.reset_levels();
+                self.last_meters = None;
+            }
+            return false;
+        }
+        self.sync_mic_meter();
         let snapshot = self.snapshot();
         let live = snapshot.is_some();
 
-        let (in_status, in_reading) = match (live, levels) {
-            (false, _) | (true, None) => (MeterStatus::Unavailable, Reading::Nothing),
-            (true, Some(l)) if !l.input_active => (MeterStatus::NoSignal, Reading::Nothing),
-            (true, Some(l)) if l.input_peak <= 0.0 => (MeterStatus::Silent, Reading::Silence),
-            (true, Some(l)) => (
+        // The input comes from the window's own capture, not from the daemon.
+        let mic = self
+            .meter
+            .as_ref()
+            .and_then(|m| m.level().read())
+            .filter(|(ago, ..)| *ago < LEVELS_STALE);
+        // The input meter works with or without a daemon: it is the window's own
+        // capture, so `live` (the daemon answering) has nothing to do with it.
+        //
+        // Three ways for it to have nothing to show, and they must not be
+        // confused: no capture could be started at all ("Unavailable" — there is
+        // no microphone we can see), a capture is running but has not published a
+        // window yet ("no signal" — start-up, or the device is delivering
+        // nothing), and a capture that died after publishing (also no signal).
+        // "Not in use" is about the *virtual* microphone nothing is recording
+        // from, which is never a thing the input bar can mean.
+        let (in_status, in_reading) = match (mic, self.meter.as_ref()) {
+            (None, None) => (MeterStatus::Unavailable, Reading::Nothing),
+            (None, Some(_)) => (MeterStatus::NoSignal, Reading::Nothing),
+            (Some((_, peak, _, _)), _) if peak <= 0.0 => (MeterStatus::Silent, Reading::Silence),
+            (Some((_, peak, rms, clip)), _) => (
                 MeterStatus::Live,
                 Reading::Signal {
-                    peak: l.input_peak,
-                    rms: l.input_rms,
-                    clip: l.input_clip,
+                    peak: peak as f64,
+                    rms: rms as f64,
+                    clip,
                 },
             ),
         };
@@ -745,20 +1006,21 @@ impl View {
         // ring are stale or irrelevant, and showing them would claim audio is
         // being sent when it is not.
         let sending = snapshot.is_some_and(|s| s.listening && s.state == State::Filtering.as_str());
-        let (out_status, out_reading) = match (live, levels) {
-            (false, _) | (true, None) => (MeterStatus::Unavailable, Reading::Nothing),
-            (true, Some(l)) if !sending || !l.output_active => {
-                (MeterStatus::Unused, Reading::Nothing)
-            }
-            (true, Some(l)) if l.output_peak <= 0.0 => (MeterStatus::Silent, Reading::Silence),
-            (true, Some(l)) => (
-                MeterStatus::Live,
-                Reading::Signal {
-                    peak: l.output_peak,
-                    rms: l.output_rms,
-                    clip: l.output_clip,
-                },
-            ),
+        // The only thing the daemon's `Levels()` still provides is the output
+        // meter, and it is meaningless unless something is being sent. Ask for it
+        // only then, so an idle window does not spend 30 round trips a second
+        // learning nothing.
+        self.want_levels
+            .store(sending, std::sync::atomic::Ordering::Relaxed);
+        let out_status = output_meter_status(live, sending, levels.as_ref());
+        let out_reading = match (out_status, levels) {
+            (MeterStatus::Live, Some(l)) => Reading::Signal {
+                peak: l.output_peak,
+                rms: l.output_rms,
+                clip: l.output_clip,
+            },
+            (MeterStatus::Silent, _) => Reading::Silence,
+            _ => Reading::Nothing,
         };
         self.input.step(now, dt, in_reading);
         self.output.step(now, dt, out_reading);
@@ -773,22 +1035,45 @@ impl View {
         };
         let input = view(&self.input, in_status, in_reading);
         let output = view(&self.output, out_status, out_reading);
-        let gain = levels.map(|l| l.agc_gain_db).unwrap_or(0.0);
-        let agc_text: SharedString = format!("{} dB", signed(gain, 1)).into();
-        let agc_active = gain.abs() >= 0.5;
-        let voice = levels.is_some_and(|l| l.voice);
+        // The two AGC badges read from the same sample as the output bar, and
+        // mean the same thing: they exist only while the daemon is filtering and
+        // something is pulling the node. Anywhere else the gain is not being
+        // measured at all, so "0.0 dB" and "no voice" would be a claim the daemon
+        // never made — `None` is drawn as an unknown instead.
+        let agc = match (levels, sending) {
+            (Some(l), true) => Some(AgcView {
+                readout: format!("{} dB", signed(l.agc_gain_db, 1)).into(),
+                active: l.agc_gain_db.abs() >= 0.5,
+                voice: l.voice,
+            }),
+            _ => None,
+        };
 
-        let next = (input, output, agc_text, agc_active, voice);
+        let next = (input, output, agc);
         if self.last_meters.as_ref() == Some(&next) {
-            return;
+            return true;
         }
         let ui = window.global::<Ui>();
         ui.set_input(next.0.clone());
         ui.set_output(next.1.clone());
-        ui.set_agc_readout(next.2.clone());
-        ui.set_agc_active(next.3);
-        ui.set_voice(next.4);
+        match &next.2 {
+            Some(agc) => {
+                ui.set_agc_readout(agc.readout.clone());
+                ui.set_agc_known(true);
+                ui.set_agc_active(agc.active);
+                ui.set_voice(agc.voice);
+            }
+            None => {
+                // Not measured, not zero: the badges say so rather than showing a
+                // gain the daemon never computed.
+                ui.set_agc_readout("—".into());
+                ui.set_agc_known(false);
+                ui.set_agc_active(false);
+                ui.set_voice(false);
+            }
+        }
         self.last_meters = Some(next);
+        true
     }
 
     // ------------------------------------------------------------- render
@@ -824,6 +1109,10 @@ impl View {
 
     fn render_absent(&self, ui: &Ui<'_>, link: &Link) {
         ui.set_live(false);
+        // No daemon, so nothing can be downloaded yet: offer the start instead.
+        ui.set_model_missing(false);
+        ui.set_downloading(false);
+        ui.set_download_possible(false);
         ui.set_switch_on(false);
         ui.set_switch_pending(false);
         ui.set_devices(ModelRc::default());
@@ -886,6 +1175,12 @@ impl View {
         ui.set_take_default(false);
         ui.set_is_default(false);
         ui.set_agc(false);
+        // The badges are not drawn without a daemon, and nothing is measuring the
+        // gain, so they carry no claim while it is gone.
+        ui.set_agc_known(false);
+        ui.set_agc_readout("—".into());
+        ui.set_agc_active(false);
+        ui.set_voice(false);
         ui.set_soft(false);
         ui.set_notify(false);
 
@@ -896,6 +1191,12 @@ impl View {
 
     fn render_present(&self, ui: &Ui<'_>, s: &Snapshot) {
         ui.set_live(true);
+        // The daemon is the authority on the model: it runs without one and
+        // downloads on request.
+        ui.set_model_missing(!s.model_present);
+        ui.set_downloading(s.model_downloading);
+        // Only offer the button when it could actually work.
+        ui.set_download_possible(s.model_download_possible);
         ui.set_can_start(false);
         ui.set_no_service_hint("".into());
 
@@ -941,6 +1242,15 @@ impl View {
                 Mood::Off,
                 "Off",
                 "Not filtering. Apps reading DeepFilter Mic get your raw microphone.".to_string(),
+            ),
+            State::NoModel => (
+                Mood::Warning,
+                "Model not installed",
+                if s.model_download_possible {
+                    "DeepFilter Mic is running, but it cannot filter until its 20 MB model is downloaded. Apps currently get your raw microphone.".to_string()
+                } else {
+                    "DeepFilter Mic is running, but it cannot filter without its model, and this build cannot download one. Point it at a model with --models DIR or DFMIC_MODELS. Apps currently get your raw microphone.".to_string()
+                },
             ),
             State::NoDevice => (
                 Mood::Warning,
@@ -1002,7 +1312,9 @@ impl View {
             .into(),
         );
         ui.set_output_note(
-            if shown_state == State::Off {
+            if shown_state == State::NoModel {
+                "No model yet, so this is your raw microphone."
+            } else if shown_state == State::Off {
                 "The filter is off, so this is your raw microphone."
             } else if !s.listening {
                 "No app is recording from DeepFilter Mic. Turn on “Hear myself” to test it."
@@ -1062,6 +1374,7 @@ impl View {
 
         // Comparison.
         ui.set_recording(self.recorder.is_some());
+        ui.set_saving_take(self.pending_take.is_some());
         ui.set_has_recording(self.take_dir.is_some());
         let playing = self.playing.as_ref().map(|(which, _)| which.clone());
         ui.set_playing(
@@ -1106,7 +1419,7 @@ impl View {
                     .get(&i)
                     .map(|p| p.value)
                     .or_else(|| own_param(s, i));
-                own.map_or(true, |v| (v - spec.default).abs() < spec.step / 2.0)
+                own.is_none_or(|v| (v - spec.default).abs() < spec.step / 2.0)
             });
         ui.set_values(ModelRc::new(VecModel::from(values)));
         ui.set_locked(ModelRc::new(VecModel::from(locked)));
@@ -1226,6 +1539,9 @@ impl Tile {
 }
 
 fn absent_tile(a: &Absent, starting: bool) -> Tile {
+    // No special case for a missing model: the daemon starts perfectly well
+    // without one and offers the download itself, so a missing model is only
+    // ever visible once it is running.
     if starting || a.unit_active {
         return Tile::plain(
             Mood::Busy,
@@ -1353,6 +1669,28 @@ fn own_param(s: &Snapshot, index: usize) -> Option<f64> {
     s.params.get(PARAMS.get(index)?.key).copied()
 }
 
+/// Which state the "sent to apps" meter is in.
+///
+/// Two different kinds of idle look alike from the outside and must not: there
+/// is no daemon to ask, or the daemon is answering and simply has nothing to
+/// report because nothing is pulling the node (or the filter is off).
+///
+/// The sample cannot decide this, because `Levels()` is only polled while
+/// something is being sent: once nothing is, the sample goes stale and reads as
+/// `None`. A daemon that is perfectly healthy therefore has to be recognised
+/// from `live` alone, before the sample is consulted.
+fn output_meter_status(live: bool, sending: bool, levels: Option<&proto::Levels>) -> MeterStatus {
+    match (live, sending, levels) {
+        (false, ..) => MeterStatus::Unavailable,
+        (true, false, _) => MeterStatus::Unused,
+        // Sending, but the first sample has not landed yet (one 33 ms frame).
+        (true, true, None) => MeterStatus::Unused,
+        (true, true, Some(levels)) if !levels.output_active => MeterStatus::Unused,
+        (true, true, Some(levels)) if levels.output_peak <= 0.0 => MeterStatus::Silent,
+        (true, true, Some(_)) => MeterStatus::Live,
+    }
+}
+
 fn snap(value: f64, spec: &proto::ParamSpec) -> f64 {
     let steps = ((value - spec.min) / spec.step).round();
     let v = (spec.min + steps * spec.step).clamp(spec.min, spec.max);
@@ -1367,6 +1705,18 @@ fn non_empty(a: &str, b: &str) -> String {
         b.to_string()
     } else {
         a.to_string()
+    }
+}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        // Closing the window ends the session: nothing this view started may
+        // outlive it. `Recorder` stops its own children when it drops, but a
+        // playing take is a bare `Child`, whose `Drop` does not kill anything.
+        if let Some((_, mut child)) = self.playing.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -1392,7 +1742,7 @@ fn group_digits(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push('\u{2009}'); // thin space
         }
         out.push(c);
@@ -1418,7 +1768,12 @@ fn sentence(s: &str) -> String {
     out
 }
 
-/// "2 minutes ago", "at 14:03", "on 3 Nov at 14:03".
+/// How long ago something happened, for a sentence: "just now", "a minute ago",
+/// "17 minutes ago", "an hour ago", "3 hours ago", "yesterday", "4 days ago".
+///
+/// Relative all the way: it is read inside "it stopped …" on the tile, where a
+/// wall clock time ("at 14:03") would need the reader to know what time it is to
+/// make sense of it.
 fn ago(unix: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1439,6 +1794,57 @@ fn ago(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The "sent to apps" bar, which has two ways to be idle and only one way
+    /// to be unavailable.
+    ///
+    /// `Levels()` is only polled while something is being sent, so a daemon that
+    /// is running with nothing recording hands back a stale sample that reads as
+    /// `None`. Treating that as "no daemon to ask" is what made a healthy daemon
+    /// report "Unavailable" whenever the self-monitor was off.
+    #[test]
+    fn sent_to_apps_distinguishes_idle_from_absent() {
+        let quiet = proto::Levels::default();
+        assert_eq!(
+            output_meter_status(false, false, None),
+            MeterStatus::Unavailable,
+            "no daemon must still read as unavailable"
+        );
+        assert_eq!(
+            output_meter_status(true, false, None),
+            MeterStatus::Unused,
+            "a live daemon with nothing recording is not in use, not unavailable"
+        );
+        assert_eq!(
+            output_meter_status(true, false, Some(&quiet)),
+            MeterStatus::Unused
+        );
+        assert_eq!(output_meter_status(true, true, None), MeterStatus::Unused);
+        assert_eq!(
+            output_meter_status(true, true, Some(&quiet)),
+            MeterStatus::Unused,
+            "no samples recorded in the window yet"
+        );
+        let active = proto::Levels {
+            output_active: true,
+            output_peak: 0.0,
+            ..proto::Levels::default()
+        };
+        assert_eq!(
+            output_meter_status(true, true, Some(&active)),
+            MeterStatus::Silent
+        );
+        let live = proto::Levels {
+            output_active: true,
+            output_peak: 0.25,
+            output_rms: 0.05,
+            ..proto::Levels::default()
+        };
+        assert_eq!(
+            output_meter_status(true, true, Some(&live)),
+            MeterStatus::Live
+        );
+    }
 
     #[test]
     fn snapping_keeps_decimal_steps_exact() {

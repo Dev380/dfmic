@@ -22,7 +22,7 @@ Both are handled here by pinning the graph to a fixed window of `frames` frames:
     `frames` frames and keeps only the final frame's output.
 
 The caller therefore threads (a) each GRU's hidden state and (b) a window of
-past frames. See `dfnpy/stream.py` for that side of the contract.
+past frames. See `runtime.py` for that side of the contract.
 
 Usage:
     convert.py --model-tar DeepFilterNet3_ll_onnx.tar.gz --out DIR [--frames 4]
@@ -266,6 +266,19 @@ def _prune_unused(graph) -> int:
     return removed
 
 
+def _read_onnx(model: onnx.ModelProto, core):
+    """Hand OpenVINO the graph through a scratch file, and no further.
+
+    `read_model` reads from disk, so the graph is written to a temporary directory
+    that is removed as soon as it has been parsed. The model it returns is fully
+    in memory, so nothing downstream needs the file again.
+    """
+    with tempfile.TemporaryDirectory() as staging:
+        scratch = Path(staging) / "graph.onnx"
+        onnx.save(model, str(scratch))
+        return core.read_model(str(scratch))
+
+
 def convert_one(src: Path, out_dir: Path, name: str, frames: int, fp16: bool, core) -> dict:
     import openvino as ov
 
@@ -273,9 +286,7 @@ def convert_one(src: Path, out_dir: Path, name: str, frames: int, fp16: bool, co
     states = rewrite(model, name, frames)
     # (state output indices are filled in below, after the model is read)
 
-    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
-        onnx.save(model, f.name)
-        ov_model = core.read_model(f.name)
+    ov_model = _read_onnx(model, core)
 
     ov_model.reshape(INPUT_SHAPES[name](frames))
 

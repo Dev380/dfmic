@@ -1,10 +1,23 @@
 {
   config,
   lib,
+  pkgs,
+  utils,
   ...
 }: let
   cfg = config.services.dfmic;
   package = cfg.package;
+
+  # Everything the daemon forks: `pw-metadata` (default-source takeover, its
+  # startup recovery and the metadata fallback), curl + sha256sum + tar + gzip
+  # (the model downloader), and `systemctl` (unit queries from the GUI).
+  #
+  # NixOS user units otherwise get its minimal default PATH, which holds only
+  # coreutils/findutils/gnugrep/gnused/systemd. Without `pw-metadata` the daemon
+  # cannot restore the default source after an unclean stop and refuses to
+  # start, which `Restart=on-failure` then turns into a restart loop.
+  # `tar -xzf` shells out to `gzip`, so gzip has to be on PATH too.
+  servicePath = with pkgs; [pipewire curl coreutils gnutar gzip systemd];
 in {
   options.services.dfmic = {
     enable = lib.mkEnableOption "DeepFilterNet3_ll virtual microphone on the Intel NPU";
@@ -63,7 +76,6 @@ in {
     # [Install] section. Enabling it remains a per-user decision.
     environment.systemPackages = [package];
     systemd.packages = [package];
-    users.groups.render = {};
 
     # `CAP_SYS_NICE` is what lets the NPU worker ask for realtime priority. A
     # wrapper is the only way to grant it: `AmbientCapabilities` is ignored (and
@@ -77,26 +89,37 @@ in {
       capabilities = "cap_sys_nice+ep";
     };
 
-    # Keep the package's upstream user unit and Install section. Only the
-    # executable command is overridden by this drop-in.
+    # Keep the package's upstream user unit and Install section. This drop-in
+    # overrides the argv and PATH, and adds the module-only settings.
+    #
+    # `path` is the declarative way to set a unit's PATH; `utils.escapeSystemdExecArgs`
+    # quotes every argv element, so a source name with spaces ("Built-in Audio
+    # Analog Stereo") stays one argument instead of becoming a capture target
+    # plus four stray parameters.
+    #
+    # (`utils` is the NixOS special arg; `lib` has no escapeSystemdExecArgs.)
     systemd.user.services.dfmic = {
       overrideStrategy = "asDropin";
+      path = servicePath;
       startLimitBurst = 5;
       startLimitIntervalSec = 60;
       serviceConfig.ExecStart = [
         ""
-        (lib.concatStringsSep " " (
+        (utils.escapeSystemdExecArgs (
           [
-            "${
+            (
               if cfg.realtime
               then "/run/wrappers/bin/dfmic"
               else "${package}/bin/dfmic"
-            } run"
+            )
+            "run"
             "--device"
             cfg.device
           ]
-          ++ lib.optional (cfg.source != null) "--source ${cfg.source}"
-          ++ lib.optional (!cfg.takeDefault) "--default-source never"
+          ++ lib.optional (cfg.source != null) "--source"
+          ++ lib.optional (cfg.source != null) cfg.source
+          ++ lib.optional (!cfg.takeDefault) "--default-source"
+          ++ lib.optional (!cfg.takeDefault) "never"
         ))
       ];
     };

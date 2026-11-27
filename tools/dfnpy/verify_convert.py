@@ -29,7 +29,31 @@ from runtime import Runtime  # noqa: E402
 # Output name -> axis along which the stream (time) runs.
 ENC_OUTPUTS = {"emb": 1, "c0": 2, "lsnr": 1, "e0": 2, "e3": 2}
 DEC_OUTPUTS = {"m": 2, "coefs": 1}
-MIN_SDR_DB = 20.0  # loose: FP16 NPU output vs FP32 CPU reference
+
+# Every output has to clear a floor, but not the same one, because the two kinds
+# of output fail in different ways.
+#
+# The convolution heads (`e0`, `e3`, `c0`) never consume a GRU output — the
+# encoder's GRU is the last stage, so these are pure causal convolutions. Once
+# the fp16 IR and the f32 CPU reference are fixed they are deterministic: over
+# 60 seeds they moved by less than one dB each (e3 66.7-67.3, e0 71.5-72.0, c0
+# 76.2-76.4). Their bound can therefore be tight enough to catch a real drift,
+# like a conv history of the wrong length.
+#
+# The GRU-carried heads (`emb`, `lsnr`, `m`, `coefs`) sit downstream of a
+# recurrence and amplify float reordering chaotically on random-noise input:
+# the same graphs ranged over 22-60 dB across those seeds. Their bound can only
+# catch a collapse, not a small drift, and has to stay low enough that a
+# different CPU (a different OpenVINO kernel, so a different summation order)
+# does not turn a correct conversion red.
+#
+# Both bounds are measured against this check's own fixed seed, where the conv
+# heads read 66.8-76.3 dB and the GRU heads 37.8-49.0 dB.
+CONV_MIN_SDR_DB = 60.0
+GRU_MIN_SDR_DB = 25.0
+MIN_SDR_DB = {name: CONV_MIN_SDR_DB for name in ("c0", "e0", "e3")} | {
+    name: GRU_MIN_SDR_DB for name in ("emb", "lsnr", "m", "coefs")
+}
 
 
 def make_inputs(frames: int, rng) -> dict[str, np.ndarray]:
@@ -88,14 +112,10 @@ def main() -> int:
                 feat_erb=np.take(feat["feat_erb"], [t], axis=2),
                 feat_spec=np.take(feat["feat_spec"], [t], axis=2),
             )
-            if enc is None:
-                continue
             enc_frames.append(t)
             for name, axis in ENC_OUTPUTS.items():
                 collected[name].append(np.take(enc[name], [-1], axis=axis))
             out = rt.push_decoders(enc)
-            if out is None:
-                continue
             dec_frames.append(t)
             for name, axis in DEC_OUTPUTS.items():
                 collected[name].append(np.take(out[name], [-1], axis=axis))
@@ -105,11 +125,18 @@ def main() -> int:
         def compare(name: str, ref: np.ndarray, axis: int, which: list[int]) -> None:
             nonlocal failures
             keep = [i for i, f in enumerate(which) if f >= args.settle]
+            if not keep:
+                print(f"  {name:6s} NOT COMPARED: every frame was skipped by --settle")
+                failures += 1
+                return
             got = np.concatenate([collected[name][i] for i in keep], axis=axis)
             aligned = np.take(ref, [which[i] for i in keep], axis=axis)
             db = sdr_db(aligned, got)
-            print(f"  {name:6s} SDR {db:7.2f} dB   max|diff| {np.abs(aligned - got).max():.3e}")
-            if db < MIN_SDR_DB:
+            floor = MIN_SDR_DB[name]
+            print(
+                f"  {name:6s} SDR {db:7.2f} dB (>= {floor:.0f})   max|diff| {np.abs(aligned - got).max():.3e}"
+            )
+            if db < floor:
                 failures += 1
 
         for name, axis in ENC_OUTPUTS.items():

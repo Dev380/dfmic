@@ -59,6 +59,13 @@ export global Ui {
     in property <bool> starting;          // a start request is in flight
     in property <string> start-label: "Start DeepFilter Mic";
     in property <string> no-service-hint;
+    // Whether the Levels card is inside the scroll viewport lives on
+    // `MainWindow.meters-on-screen`, which the window computes and Rust reads;
+    // there is deliberately no copy of it here.
+    // No model on disk: the daemon cannot start until one is downloaded.
+    in property <bool> model-missing;
+    in property <bool> downloading;
+    in property <bool> download-possible;
 
     // Quick facts on the tile.
     in property <string> device-chip;
@@ -74,7 +81,8 @@ export global Ui {
     in property <MeterView> output: { status: MeterStatus.unavailable, rms-db: -100, peak-db: -100, hold-db: -100, readout: "—" };
     in property <string> input-note;
     in property <string> output-note;
-    in property <string> agc-readout;     // "+6.0 dB"
+    in property <string> agc-readout;     // "+6.0 dB", or "—" when it is not measured
+    in property <bool> agc-known;         // the daemon is metering the AGC right now
     in property <bool> agc-active;
     in property <bool> voice;
 
@@ -92,6 +100,7 @@ export global Ui {
     in property <bool> monitor;
     in property <string> monitor-target;
     in property <bool> recording;          // a take is being captured
+    in property <bool> saving-take;        // stopped, and the files are still being finished
     in property <bool> has-recording;      // there is a take to play
     in property <string> playing;          // "", "raw" or "filtered"
     in property <string> playing-label;    // what is playing, for the badge
@@ -131,6 +140,7 @@ export global Ui {
 
     callback toggle();
     callback start-service();
+    callback download-model();
     callback set-param(int, float);
     callback reset-param(int);
     callback reset-params();
@@ -280,7 +290,17 @@ component Hero inherits Rectangle {
                     opacity: Ui.switch-pending ? 0.75 : 1;
                     toggled => { Ui.toggle(); }
                 }
-                if !Ui.live && Ui.can-start: Button {
+                if Ui.live && Ui.model-missing && Ui.download-possible: Button {
+                    text: Ui.downloading ? "Downloading…" : "Download the model (20 MB)";
+                    kind: ButtonKind.primary;
+                    tile-text: ink;
+                    enabled: !Ui.downloading;
+                    has-icon: true;
+                    icon: IconKind.download;
+                    accessible-label: "Download the model";
+                    clicked => { Ui.download-model(); }
+                }
+                if !Ui.live && !Ui.model-missing && Ui.can-start: Button {
                     text: Ui.starting ? "Starting…" : Ui.start-label;
                     kind: Ui.mood == Mood.failed ? ButtonKind.on-tile : ButtonKind.primary;
                     tile-text: ink;
@@ -559,6 +579,12 @@ export component MainWindow inherits Window {
 
     // Which disclosures and confirmations are open. Only the window uses these.
     in-out property <bool> confirm-monitor;
+    /// Whether the Levels card is inside the scroll viewport.
+    ///
+    /// The meters animate continuously and every frame repaints the whole
+    /// window, so the caller stops updating them while they are scrolled out of
+    /// view. Read from Rust as `window.get_meters_on_screen()`.
+    out property <bool> meters-on-screen: scroller.meters-on-screen;
     in-out property <bool> confirm-reset-all;
     in-out property <bool> tuning-open;
     in-out property <bool> rare-open;
@@ -612,10 +638,20 @@ export component MainWindow inherits Window {
             // scrollbar repaints the whole window at the display rate. Measured:
             // 62 frames/s for 30 meter ticks, 16.9% of a core against 10.5% with
             // the scrollbars gone. Wheel and trackpad scrolling still work.
-            ScrollView {
+            scroller := ScrollView {
                 vertical-stretch: 1;
                 vertical-scrollbar-policy: always-off;
                 horizontal-scrollbar-policy: always-off;
+                // Whether the Levels card is inside the viewport. The meters are
+                // the only thing in the window that animates continuously, and
+                // each frame repaints the whole window, so drawing them while
+                // they are scrolled out of view is pure waste. The caller reads
+                // this and stops updating them.
+                // `content-y`/`content-height` are the viewport's own scroll
+                // offset and size (the `viewport-*` names are deprecated).
+                out property <bool> meters-on-screen:
+                    levels-section.y + levels-section.height > self.content-y
+                    && levels-section.y < self.content-y + self.content-height;
                 content := VerticalLayout {
                     alignment: start;
                     padding-left: 16px;
@@ -646,7 +682,7 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    Section {
+                    levels-section := Section {
                         title: "Levels";
                         aside: Ui.live ? "dBFS, peak and average" : "";
                         VerticalLayout {
@@ -685,9 +721,14 @@ export component MainWindow inherits Window {
                                     has-icon: true;
                                     icon: IconKind.waveform;
                                 }
+                                // Both badges are an unknown while the daemon is not
+                                // metering the gain (nothing is pulling the node),
+                                // because a gain of "0.0 dB" and "No voice" there
+                                // would be a measurement that was never taken.
                                 Badge {
-                                    text: Ui.voice ? "Voice detected" : "No voice";
-                                    ink: Ui.voice ? Theme.accent : Theme.muted;
+                                    text: !Ui.agc-known ? "Voice: not measured"
+                                        : Ui.voice ? "Voice detected" : "No voice";
+                                    ink: Ui.agc-known && Ui.voice ? Theme.accent : Theme.muted;
                                     has-icon: true;
                                     icon: IconKind.mic;
                                 }
@@ -698,7 +739,7 @@ export component MainWindow inherits Window {
 
                     Section {
                         title: "Compare";
-                        aside: Ui.recording ? "recording" : Ui.has-recording ? "recorded" : "";
+                        aside: Ui.recording ? "recording" : Ui.saving-take ? "saving" : Ui.has-recording ? "recorded" : "";
                         VerticalLayout {
                             padding-top: 12px;
                             spacing: 10px;
@@ -712,7 +753,11 @@ export component MainWindow inherits Window {
                                     has-icon: true;
                                     icon: Ui.recording ? IconKind.cross : IconKind.record;
                                     kind: Ui.recording ? ButtonKind.secondary : ButtonKind.primary;
-                                    enabled: Ui.live && Ui.playing == "";
+                                    // Not while a stopped take is still being
+                                    // finished: its recorders still have the two
+                                    // files open, and a new take would write into
+                                    // them underneath.
+                                    enabled: Ui.live && Ui.playing == "" && (!Ui.saving-take || Ui.recording);
                                     accessible-label: Ui.recording ? "Stop recording" : "Record your microphone and what apps hear";
                                     clicked => { Ui.toggle-recording(); }
                                 }
@@ -728,7 +773,14 @@ export component MainWindow inherits Window {
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                             }
-                            if Ui.has-recording && !Ui.recording: VerticalLayout {
+                            // Stopped, but the WAV headers are not written yet: the
+                            // files on disk are not playable until the recorders
+                            // have exited, so say so rather than offering a broken
+                            // Play button.
+                            if Ui.saving-take: Small {
+                                text: "Finishing the recording…";
+                            }
+                            if Ui.has-recording && !Ui.recording && !Ui.saving-take: VerticalLayout {
                                 spacing: 8px;
                                 HorizontalLayout {
                                     spacing: 8px;

@@ -2,7 +2,7 @@
 //!
 //! Like a hardware meter: the bar jumps up instantly and falls at a fixed rate
 //! in dB, the peak marker holds before falling, the numeric readout follows the
-//! held peak (so it does not flicker), and clipping latches for a few seconds.
+//! held peak (so it does not flicker), and clipping latches until it is reset.
 
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,11 @@ const RELEASE_DB_PER_S: f32 = 24.0;
 const HOLD: Duration = Duration::from_millis(1500);
 const HOLD_RELEASE_DB_PER_S: f32 = 12.0;
 /// How long a clip stays lit after the last clipped sample.
+///
+/// Real meters latch the clip lamp until it is reset by hand, but a lamp that
+/// needs a click to go out is exactly the kind of thing that gets forgotten; a
+/// few seconds is long enough to be noticed from across the room and short
+/// enough not to become wallpaper. Reset still clears it immediately.
 const CLIP_LATCH: Duration = Duration::from_secs(3);
 /// The readout changes at most this often.
 const READOUT_PERIOD: Duration = Duration::from_millis(200);
@@ -100,6 +105,23 @@ impl Ballistics {
         }
     }
 
+    /// Drop the level state but keep the clip latch.
+    ///
+    /// Used when the meters go off screen: the level is stale by the time they
+    /// come back and must not be drawn as if it were current, but a clip that
+    /// was latched stays latched until the user resets it.
+    pub fn reset_levels(&mut self) {
+        let now = Instant::now();
+        self.rms_db = BOTTOM_DB;
+        self.peak_db = BOTTOM_DB;
+        self.hold_db = BOTTOM_DB;
+        self.hold_until = now;
+        self.readout_db = None;
+        self.readout_at = now;
+        // `clip_until` is deliberately left alone: the lamp stays lit until it
+        // expires on its own or the user resets it.
+    }
+
     pub fn clipped(&self, now: Instant) -> bool {
         self.clip_until.is_some_and(|until| now < until)
     }
@@ -143,5 +165,37 @@ mod tests {
         assert_eq!(minus(-23.44, 1), "−23.4");
         assert_eq!(minus(-0.01, 1), "0.0");
         assert_eq!(minus(6.0, 1), "6.0");
+    }
+
+    /// Going off screen resets the level but must not clear a latched clip: the
+    /// lamp is for something that already happened, and scrolling it out of view
+    /// is not the user acknowledging it.
+    #[test]
+    fn resetting_levels_keeps_the_clip_latch() {
+        let now = Instant::now();
+        let mut b = Ballistics::new();
+        b.step(
+            now,
+            0.033,
+            Reading::Signal {
+                peak: 1.0,
+                rms: 0.5,
+                clip: true,
+            },
+        );
+        assert!(b.clipped(now), "full scale did not latch the clip lamp");
+        b.reset_levels();
+        assert_eq!(b.rms_db, BOTTOM_DB);
+        assert_eq!(b.peak_db, BOTTOM_DB);
+        assert_eq!(b.hold_db, BOTTOM_DB);
+        assert!(
+            b.clipped(now),
+            "resetting the levels cleared the latched clip"
+        );
+        b.reset_clip();
+        assert!(
+            !b.clipped(now),
+            "the reset invokable did not clear the lamp"
+        );
     }
 }

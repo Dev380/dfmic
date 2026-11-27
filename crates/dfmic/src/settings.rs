@@ -13,7 +13,10 @@ use crate::proto::{Param, MASK_REDUCE_NAMES, SOFT_PRESET};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub enabled: bool,
+    // Deliberately no `enabled` here. Whether the filter is on is runtime state,
+    // not a setting: the daemon always starts with it off, so nothing can grab
+    // the microphone unattended at login. An old file's `enabled = true` is
+    // simply ignored.
     pub source: Option<String>,
     pub agc: bool,
     pub monitor: bool,
@@ -28,7 +31,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            enabled: true,
             source: None,
             agc: true,
             monitor: false,
@@ -61,10 +63,10 @@ impl Default for DeviceSettings {
             min_thresh: Param::MinThresh.spec().default,
             max_erb_thresh: Param::MaxErbThresh.spec().default,
             max_df_thresh: Param::MaxDfThresh.spec().default,
-            // Two hops is the measured floor: the DSP consumes 480-sample hops
-            // while PipeWire hands out one quantum at a time, so a shallower
-            // queue underruns (one hop gave 136 underruns in 25 s) and a deeper
-            // one only adds latency.
+            // Zero is libDF's default and the adaptive rule's floor: the queue
+            // keeps two hops regardless (see `MIN_HOPS` in `pw.rs`), so this is
+            // reserve the user asks for *on top* of the measured floor rather
+            // than the floor itself.
             min_buffer: Param::MinBuffer.spec().default,
             mask_reduce: "none".into(),
             soft: false,
@@ -243,19 +245,42 @@ pub fn save_atomic(path: &Path, contents: &str) -> Result<(), String> {
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+    // The name carries a random suffix and is created exclusively, so two
+    // processes saving at once cannot interleave in one file, and an existing
+    // symlink at the temporary's name is a failure rather than a file written
+    // through a link the caller never asked for.
+    let temporary = path.with_extension(format!("tmp.{}.{}", std::process::id(), random_suffix()));
     let result = (|| -> Result<(), String> {
-        let mut file = fs::File::create(&temporary)
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
             .map_err(|error| format!("could not create {}: {error}", temporary.display()))?;
         file.write_all(contents.as_bytes())
             .and_then(|()| file.sync_all())
             .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
+        drop(file);
         fs::rename(&temporary, path)
             .map_err(|error| format!("could not replace {}: {error}", path.display()))?;
+        // The rename is atomic but not durable until the *directory* is synced:
+        // without this a power cut can leave the old contents, or no file at all,
+        // even though `rename` returned success.
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("could not sync {}: {error}", parent.display()))?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// A short unpredictable suffix, so two writers never pick the same temporary.
+fn random_suffix() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    format!("{:x}", hasher.finish() as u32)
 }

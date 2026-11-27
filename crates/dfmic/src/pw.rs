@@ -5,11 +5,10 @@
 //! virtual microphone), and an optional monitor stream that plays the same
 //! audio back so the user can hear themselves.
 //!
-//! Process callbacks run on PipeWire's realtime thread and only touch the
-//! lock-free rings and atomics below. Everything else happens on the main
-//! thread while holding the loop lock, which is what makes the proxies and
-//! listeners safe to touch from both: PipeWire stops dispatching callbacks
-//! while the lock is held.
+//! Process callbacks run on PipeWire's *data loop*, a third thread that the loop
+//! lock does not cover, and only touch the lock-free rings and atomics below.
+//! Main-loop and registry callbacks run on the loop thread under the lock, which
+//! is what makes the proxies and listeners safe to touch from both.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -17,7 +16,7 @@ use std::ffi::CString;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pipewire as pw;
 use pw::properties::properties;
@@ -70,6 +69,14 @@ const SHRINK_BACKOFF_MAX_MS: u64 = 120_000;
 /// a series of avoidable underruns.
 const MIN_HOPS: usize = 2;
 
+/// The deepest the output queue may be asked to hold: one second of audio,
+/// which is where libDF gives up entirely.
+///
+/// The rings are sized one hop beyond this, so a full queue can still take the
+/// next hop the worker produces; the adaptive target never asks for more than
+/// this, which is what keeps the "latency is bounded" rule true.
+const MAX_QUEUE_SAMPLES: usize = RATE as usize;
+
 #[derive(Default)]
 pub struct RegistryData {
     sources: BTreeMap<String, Device>,
@@ -82,10 +89,11 @@ pub struct RegistryData {
     own_node: Option<u32>,
     /// Every link in the graph, by global id, as (output node, input node).
     ///
-    /// The stream state cannot answer "is anything listening": our capture
-    /// stream keeps the graph running, so the exported node never suspends and
-    /// never leaves `Streaming` when its last consumer goes away. The links are
-    /// the authoritative answer, and PipeWire publishes them as globals.
+    /// The stream state cannot answer "is anything listening": the exported node
+    /// suspends and resumes with its consumers, and a consumer that is linked but
+    /// silent does not make it `Streaming`, so the state is neither necessary nor
+    /// sufficient. The links are the authoritative answer, and PipeWire publishes
+    /// them as globals.
     links: BTreeMap<u32, (u32, u32)>,
     pub default_source: Option<String>,
     pub default_sink: Option<String>,
@@ -238,14 +246,21 @@ pub struct Shared {
     pub played: AtomicU64,
     pub overruns: AtomicU64,
     pub underruns: AtomicU64,
+    /// Nudges the daemon's event loop when something changed out here.
+    ///
+    /// The loop blocks on its request channel instead of polling, so the
+    /// PipeWire callbacks — which run on the loop thread and are the main source
+    /// of "something changed" — have to ring this bell themselves.
+    wake: Mutex<Option<std::sync::mpsc::Sender<crate::control::Request>>>,
     pub consumers: AtomicBool,
     pub monitor_active: AtomicBool,
     pub filtering: AtomicBool,
     pub min_buffer: AtomicUsize,
     /// The output queue's target depth in samples, adapted at runtime.
     ///
-    /// libDF calls this `proc_delay`: it starts at one hop and moves as the
-    /// machine demands, rather than being fixed by configuration.
+    /// libDF calls this `proc_delay`. It starts at [`MIN_HOPS`] hops, not one:
+    /// one hop is never enough for a callback that must not block (see the
+    /// constant's note), and it moves from there as the machine demands.
     proc_delay: AtomicUsize,
     /// Earliest time (ms since start) at which another shrink may be tried.
     shrink_after_ms: AtomicU64,
@@ -253,8 +268,23 @@ pub struct Shared {
     shrink_backoff_ms: AtomicU64,
     priming: AtomicBool,
     monitor_priming: AtomicBool,
+    /// Samples of silence the worker should push into the output ring, because
+    /// the adaptive target just got deeper.
+    ///
+    /// A counter rather than a direct write: only the worker may produce into
+    /// that ring, and only the playback callback may consume it. A third thread
+    /// adding audio would race the producer's `write` index.
+    pad_output: AtomicUsize,
+    /// Bumped by anyone who wants a playback ring dropped and re-primed.
+    ///
+    /// A counter rather than a direct `clear`, because only the playback callback
+    /// may move a ring's read index: see [`ring`].
+    output_reprime: AtomicU64,
+    monitor_reprime: AtomicU64,
+    /// What the playback callback has already acted on. Written only by it.
+    output_reprime_seen: AtomicU64,
+    monitor_reprime_seen: AtomicU64,
     reset_generation: AtomicU64,
-    input_levels: MetricRing,
     output_levels: MetricRing,
     timing: TimingRing,
     pub inferences: AtomicU64,
@@ -262,14 +292,22 @@ pub struct Shared {
     /// this and the capture callback wakes it, so a hop is processed the moment
     /// it is complete instead of on the next poll tick.
     hop_ready: AtomicU32,
+    /// Why the capture stream last failed, so the daemon can retry it rather
+    /// than exit.
+    capture_failure: Mutex<Option<String>>,
+    /// Why the self-monitor stream last failed, for the daemon to report.
+    monitor_failure: Mutex<Option<String>>,
     voice: AtomicBool,
     agc_gain: AtomicU32,
     started: Instant,
 }
 
 impl Shared {
-    pub fn new(capacity: usize) -> Arc<Self> {
+    /// Rings sized for the deepest queue the adaptive rule may ask for, plus one
+    /// hop of slack so a full queue can still take the next hop.
+    pub fn new() -> Arc<Self> {
         let started = Instant::now();
+        let capacity = MAX_QUEUE_SAMPLES + HOP_SIZE;
         Arc::new(Self {
             input: ring::Ring::new(capacity),
             output: ring::Ring::new(capacity),
@@ -281,6 +319,7 @@ impl Shared {
             played: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
+            wake: Mutex::new(None),
             consumers: AtomicBool::new(false),
             monitor_active: AtomicBool::new(false),
             filtering: AtomicBool::new(false),
@@ -290,12 +329,18 @@ impl Shared {
             shrink_backoff_ms: AtomicU64::new(0),
             priming: AtomicBool::new(true),
             monitor_priming: AtomicBool::new(true),
+            output_reprime: AtomicU64::new(0),
+            monitor_reprime: AtomicU64::new(0),
+            output_reprime_seen: AtomicU64::new(0),
+            monitor_reprime_seen: AtomicU64::new(0),
             reset_generation: AtomicU64::new(0),
-            input_levels: MetricRing::new(),
+            pad_output: AtomicUsize::new(0),
             output_levels: MetricRing::new(),
             timing: TimingRing::new(started),
             inferences: AtomicU64::new(0),
             hop_ready: AtomicU32::new(0),
+            monitor_failure: Mutex::new(None),
+            capture_failure: Mutex::new(None),
             voice: AtomicBool::new(false),
             agc_gain: AtomicU32::new(0.0f32.to_bits()),
             started,
@@ -309,23 +354,109 @@ impl Shared {
             }
         }
         self.failed.store(true, Ordering::SeqCst);
+        // Every asynchronous failure has to ring the loop: it blocks on its
+        // request channel, so without this the error is not seen until an
+        // unrelated wake, up to the 30 s safety timeout later.
+        self.wake_loop();
     }
 
     pub fn error(&self) -> Option<String> {
         self.error.lock().ok().and_then(|mut error| error.take())
     }
 
+    /// Record that the self-monitor stream failed, for the daemon to report.
+    ///
+    /// This is not fatal and it is not retried: a sink that will not open stays
+    /// that way until the user picks a different output, and recreating the
+    /// stream every tick would churn it. The daemon turns the flag into a notice
+    /// and switches monitoring off.
+    fn note_monitor_failure(&self, message: String) {
+        if let Ok(mut slot) = self.monitor_failure.lock() {
+            *slot = Some(message);
+        }
+        self.monitor_active.store(false, Ordering::SeqCst);
+        // The loop is asleep on its request channel; a failure nobody is told
+        // about is not reported until the next unrelated wake, which can be the
+        // 30 s safety timeout.
+        self.wake_loop();
+    }
+
+    /// Note that the capture stream lost its device, without taking the daemon
+    /// down.
+    ///
+    /// A microphone being unplugged is an `Error` state in PipeWire, not a
+    /// transition to `Paused`, so the registry's disappearance bookkeeping never
+    /// gets a chance to run on its own. Recording it here lets the daemon show
+    /// `NoDevice` and reconnect when the device returns, which is the difference
+    /// between a Bluetooth headset dropping out and the daemon exiting.
+    fn note_capture_loss(&self, message: String) {
+        if let Ok(mut slot) = self.capture_failure.lock() {
+            // Only the first reason is kept until it is taken: a device that is
+            // being replugged produces a burst of them and they all say the same
+            // thing.
+            if slot.is_none() {
+                *slot = Some(message);
+            }
+        }
+        self.wake_loop();
+    }
+
+    /// Take the pending capture loss, if any.
+    pub fn take_capture_loss(&self) -> Option<String> {
+        self.capture_failure
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
+    /// Take the pending self-monitor failure, if any.
+    pub fn take_monitor_failure(&self) -> Option<String> {
+        self.monitor_failure
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
     pub fn set_monitor_active(&self, active: bool) {
-        self.monitor_active.store(active, Ordering::SeqCst);
-        self.monitor_priming.store(true, Ordering::Release);
+        let was = self.monitor_active.swap(active, Ordering::SeqCst);
+        if was != active {
+            self.request_monitor_reprime();
+            // Same reason as `set_consumers`: monitoring is a consumer too, and
+            // the worker may be in a long sleep.
+            self.wake_worker();
+        }
+    }
+
+    /// Ask the playback callback to drop what is queued and start from silence,
+    /// on the monitor ring only.
+    pub fn request_monitor_reprime(&self) {
+        self.monitor_reprime.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Ask the worker to reset both ends. The worker is the input consumer and
     /// the output producer, so this preserves every ring's SPSC ownership.
     pub fn reset_audio(&self) {
         self.reset_generation.fetch_add(1, Ordering::AcqRel);
-        self.priming.store(true, Ordering::Release);
-        self.monitor_priming.store(true, Ordering::Release);
+        // A new stream means a new depth to learn: keeping the previous session's
+        // target and its non-decaying backoff made every reset start deeper and
+        // slower to react than the last.
+        self.reset_delay();
+        self.request_reprime();
+    }
+
+    /// Take the sample count the worker should pad the output ring with, if any.
+    pub fn take_pad(&self) -> usize {
+        self.pad_output.swap(0, Ordering::AcqRel)
+    }
+
+    /// Ask the playback callback to drop what is queued and start from silence.
+    ///
+    /// A request, not a `clear`: the callback owns the read side of the output
+    /// rings, and moving it from another thread would race with the pop it is in
+    /// the middle of.
+    pub fn request_reprime(&self) {
+        self.output_reprime.fetch_add(1, Ordering::AcqRel);
+        self.monitor_reprime.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn reset_generation(&self) -> u64 {
@@ -351,13 +482,15 @@ impl Shared {
 
     pub fn levels(&self) -> Levels {
         let now = self.started.elapsed().as_secs_f64();
-        let input = self.input_levels.aggregate(now);
         let output = self.output_levels.aggregate(now);
         Levels {
-            input_active: input.active,
-            input_peak: input.peak,
-            input_rms: input.rms,
-            input_clip: input.clip,
+            // The daemon no longer meters its input: the window captures the
+            // microphone itself when it wants a level, so nothing here is paid
+            // for by a daemon that nobody is watching.
+            input_active: false,
+            input_peak: 0.0,
+            input_rms: 0.0,
+            input_clip: false,
             output_active: output.active,
             output_peak: output.peak,
             output_rms: output.rms,
@@ -397,11 +530,28 @@ impl Shared {
     /// fixed interval would cost a click every time. Instead each failure
     /// doubles the delay before the next attempt, which converges on the depth
     /// this machine can hold instead of oscillating around it.
+    ///
+    /// The target is *filled* as well as raised. Raising it alone changed the
+    /// trim length without putting any audio behind it, so the next callback
+    /// trimmed to a depth the ring did not hold, underran, and grew again — an
+    /// underrun every callback rather than one per failed shrink.
     fn grow_delay(&self) {
         let current = self.proc_delay.load(Ordering::Relaxed);
-        // One second of audio is where libDF gives up entirely.
-        if current < RATE as usize {
-            self.proc_delay.store(current + HOP_SIZE, Ordering::Relaxed);
+        // Up to one second of audio, which is where libDF gives up entirely, and
+        // never past `MAX_QUEUE_SAMPLES`: the rings are sized one hop beyond that
+        // so the producer always has room to fill the target.
+        debug_assert!(self.output.capacity() >= MAX_QUEUE_SAMPLES + HOP_SIZE);
+        if current + HOP_SIZE <= MAX_QUEUE_SAMPLES {
+            let next = current + HOP_SIZE;
+            self.proc_delay.store(next, Ordering::Relaxed);
+            // Only the worker may write this ring, so it is asked rather than
+            // filled here, and `priming` is left alone: asking for the pad to be
+            // silence is not the same as asking for the queue to be dropped.
+            self.pad_output
+                .fetch_add(next.saturating_sub(self.output.len()), Ordering::AcqRel);
+        } else {
+            // At the ceiling already: there is no deeper to go.
+            return;
         }
         let backoff = self.shrink_backoff_ms.load(Ordering::Relaxed);
         let next = if backoff == 0 {
@@ -412,6 +562,19 @@ impl Shared {
         self.shrink_backoff_ms.store(next, Ordering::Relaxed);
         self.shrink_after_ms
             .store(millis_timestamp(self.started) + next, Ordering::Relaxed);
+    }
+
+    /// Forget the adaptive depth and its backoff.
+    ///
+    /// Called when filtering stops and when the stream is reset: the depth that
+    /// this machine held is a property of a session that has ended, and the
+    /// backoff only ever doubled, so without this every enable/disable cycle
+    /// would leave the controller slower to react than the last one.
+    pub fn reset_delay(&self) {
+        self.proc_delay
+            .store(HOP_SIZE * MIN_HOPS, Ordering::Relaxed);
+        self.shrink_backoff_ms.store(0, Ordering::Relaxed);
+        self.shrink_after_ms.store(0, Ordering::Relaxed);
     }
 
     /// Shrink the target by one hop once the current depth has held for long
@@ -438,7 +601,15 @@ impl Shared {
     /// A futex rather than a condvar: the capture callback runs on PipeWire's
     /// realtime thread and must not take a lock, and `FUTEX_WAKE` needs none.
     /// The timeout bounds how long shutdown has to wait for the worker.
-    pub fn wait_for_hop(&self) {
+    /// Block until a whole hop is available in the input ring, or `timeout`
+    /// expires.
+    ///
+    /// A futex rather than a condvar: the capture callback runs on PipeWire's
+    /// realtime thread and must not take a lock, and `FUTEX_WAKE` needs none.
+    /// The timeout bounds how long shutdown has to wait for the worker, and while
+    /// nothing is listening it is the only thing that wakes it — a long timeout
+    /// there is what makes an idle daemon cost nothing.
+    pub fn wait_for_hop(&self, timeout: Duration) {
         if self.input.len() >= HOP_SIZE {
             return;
         }
@@ -449,8 +620,8 @@ impl Shared {
             return;
         }
         let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 2_000_000,
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
         };
         unsafe {
             libc::syscall(
@@ -465,7 +636,7 @@ impl Shared {
 
     /// Wake the worker. Safe to call from a realtime callback: one atomic and
     /// one syscall, no allocation and no lock.
-    fn wake_worker(&self) {
+    pub fn wake_worker(&self) {
         self.hop_ready.fetch_add(1, Ordering::Release);
         unsafe {
             libc::syscall(
@@ -486,16 +657,42 @@ impl Shared {
             drop(registry);
             self.set_consumers(consumers);
         }
+        // After the lock is released: the loop takes the same lock, and waking it
+        // while holding it would invert the order.
+        self.wake_loop();
+    }
+
+    /// Let the daemon's event loop know that something changed.
+    pub fn wake_loop(&self) {
+        if let Ok(slot) = self.wake.lock() {
+            if let Some(sender) = slot.as_ref() {
+                crate::control::wake(sender);
+            }
+        }
+    }
+
+    /// Give the loop its wake sender. Called once, right after the channel exists.
+    pub fn set_wake_sender(&self, sender: std::sync::mpsc::Sender<crate::control::Request>) {
+        if let Ok(mut slot) = self.wake.lock() {
+            *slot = Some(sender);
+        }
     }
 
     /// Record how many consumers our node has, resetting the queue on arrival.
     fn set_consumers(&self, count: usize) {
         let was = self.consumers.swap(count > 0, Ordering::SeqCst);
         if count > 0 && !was {
-            // A consumer just attached: whatever is queued is from before it,
-            // so start from silence rather than from a stale tail.
-            self.output.clear();
-            self.priming.store(true, Ordering::Release);
+            // A consumer just attached: whatever is queued is from before it, so
+            // start from silence rather than from a stale tail. Only a request is
+            // made here — dropping the queue is the playback callback's job,
+            // because it owns the read side of the ring (see `ring`).
+            self.request_reprime();
+        }
+        if was != (count > 0) {
+            // The worker sleeps for a long time while nothing is listening, so a
+            // consumer arriving has to wake it: the capture callback only starts
+            // feeding the ring once it is listening.
+            self.wake_worker();
         }
     }
 }
@@ -508,10 +705,15 @@ fn millis_timestamp(started: Instant) -> u64 {
 ///
 /// PipeWire mapped this memory for us (`MAP_BUFFERS`) and the negotiated format
 /// is 32-bit float, so the cast is sound. The chunk's offset and size are in
-/// bytes and are clamped to the mapped region before use.
+/// bytes, and either may be nonsense if a client misbehaves: both are clamped to
+/// the mapped region *before* the pointer is formed, because `ptr.add()` past the
+/// allocation is undefined even when the slice built from it would be empty.
 unsafe fn samples(data: &mut [u8], offset: u32, size: u32) -> &mut [f32] {
     let offset = offset as usize;
-    let frames = (size as usize / 4).min(data.len().saturating_sub(offset) / 4);
+    if offset >= data.len() {
+        return &mut [];
+    }
+    let frames = (size as usize / 4).min((data.len() - offset) / 4);
     unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().add(offset).cast::<f32>(), frames) }
 }
 
@@ -535,7 +737,13 @@ fn capture_process(shared: &Shared, stream: &pw::stream::Stream) {
     shared
         .captured
         .fetch_add(samples.len() as u64, Ordering::Relaxed);
-    shared.input_levels.record(shared.started, samples);
+    // Nothing is recording from us: drop the samples here rather than pushing
+    // them for the worker to throw away. The daemon measures no levels — the
+    // meters are the window's own capture streams — so with nobody listening
+    // there is genuinely nothing to do with this audio.
+    if !shared.listening() {
+        return;
+    }
     if !shared.input.push(samples) {
         shared
             .overruns
@@ -565,11 +773,30 @@ fn playback_process(shared: &Shared, stream: &pw::stream::Stream, monitor: bool)
         requested.min(capacity)
     };
 
-    let (ring, priming) = if monitor {
-        (&shared.monitor_output, &shared.monitor_priming)
+    let (ring, priming, reprime, reprime_seen) = if monitor {
+        (
+            &shared.monitor_output,
+            &shared.monitor_priming,
+            &shared.monitor_reprime,
+            &shared.monitor_reprime_seen,
+        )
     } else {
-        (&shared.output, &shared.priming)
+        (
+            &shared.output,
+            &shared.priming,
+            &shared.output_reprime,
+            &shared.output_reprime_seen,
+        )
     };
+    // Somebody asked for this queue to be dropped and refilled. They could not do
+    // it themselves — only this callback may move the read index — so it happens
+    // here, before anything is popped, and it happens once per request.
+    let requested = reprime.load(Ordering::Acquire);
+    if reprime_seen.load(Ordering::Relaxed) != requested {
+        ring.discard(ring.len());
+        reprime_seen.store(requested, Ordering::Relaxed);
+        priming.store(true, Ordering::Release);
+    }
     let filtering = shared.filtering.load(Ordering::Acquire);
     if filtering && !priming.load(Ordering::Acquire) {
         // Hold the queue at its adaptive target. This is libDF's rule: it keeps
@@ -628,13 +855,13 @@ fn playback_process(shared: &Shared, stream: &pw::stream::Stream, monitor: bool)
 
 /// The exported stream came up.
 ///
-/// This deliberately says nothing about consumers: with our capture stream
-/// keeping the graph running, this fires once at startup and then not again when
-/// applications come and go. Link bookkeeping in the registry is what tracks
-/// them; this only makes sure the queue starts from silence.
+/// This fires every time a consumer attaches, because the node suspends itself
+/// when the last one leaves. The queue is dropped and re-primed from silence so a
+/// new listener does not start with the tail of audio buffered for the previous
+/// one. Whether anything is *listening* is still answered by the link globals,
+/// not by this: an attach and a link are not the same event.
 fn on_source_started(shared: &Shared) {
-    shared.output.clear();
-    shared.priming.store(true, Ordering::Release);
+    shared.request_reprime();
 }
 
 /// Extract the `name` field from PipeWire's `Spa:String:JSON` metadata value,
@@ -686,6 +913,8 @@ pub struct Bridge {
     streams: RefCell<Streams>,
     monitor_target: RefCell<Option<String>>,
     metadata: Rc<MetadataSlot>,
+    /// Whether the capture stream is currently started.
+    capture_active: AtomicBool,
     // The listeners are owned for their `Drop` (which removes the hook), and are
     // declared before the objects they watch so they are dropped first.
     #[allow(dead_code)]
@@ -728,7 +957,19 @@ impl Bridge {
                 let shared = Rc::clone(&shared);
                 core.add_listener_local()
                     .error(move |_, _, result, message| {
-                        shared.set_error(format!("{message} ({result})"));
+                        // The core reports `ENOENT` when the *target of one of our
+                        // streams* disappears, not only when the connection itself
+                        // dies — unplugging a microphone produces exactly this. That
+                        // is a device loss and the daemon carries on; anything else
+                        // (a real protocol or connection error) is fatal, because
+                        // nothing can work without the core.
+                        if result == -2 {
+                            shared.note_capture_loss(format!(
+                                "the graph reported {message} ({result})"
+                            ));
+                        } else {
+                            shared.set_error(format!("{message} ({result})"));
+                        }
                     })
                     .register()
             };
@@ -745,6 +986,7 @@ impl Bridge {
                 streams: RefCell::new(Streams::default()),
                 monitor_target: RefCell::new(None),
                 metadata,
+                capture_active: AtomicBool::new(true),
                 core_listener,
                 registry_listener,
                 registry,
@@ -833,13 +1075,13 @@ impl Bridge {
         };
         // The node is exported, not linked: applications connect to it.
         props.insert("node.autoconnect", "0");
-        // Deliberately *not* `node.passive`. A passive node stays running with
-        // no consumers, so the stream never leaves `Streaming` and the daemon
-        // never learns that the last application disconnected: it would filter
-        // for ever and the output meter would keep showing signal. The stream
-        // state is how "is anything listening" is detected (`on_source_started`
-        // / `on_source_stopped`), so the node has to go idle when it has no
-        // consumers.
+        // Deliberately *not* `node.passive`. A passive node keeps the graph
+        // running with no consumer, which burns the NPU and the capture stream
+        // for audio nobody receives. Whether anything is listening is answered by
+        // the link globals the registry tracks (see `RegistryData::links`), not by
+        // the stream state: a linked-but-silent consumer never makes the node
+        // `Streaming`, and this node suspends and resumes as its consumers come
+        // and go.
         set_latency(&mut props, NEUTRAL_QUANTUM);
         let slot = self.new_stream(
             node_name,
@@ -936,6 +1178,35 @@ impl Bridge {
             self.start_monitor(target)?;
         }
         Ok(())
+    }
+
+    /// Start or stop the physical-microphone capture stream.
+    ///
+    /// Off when nothing needs audio: the stream is the only reason the graph
+    /// keeps running with no consumers, so pausing it is what makes an idle
+    /// daemon actually idle rather than a low hum of callbacks. Resuming resets
+    /// the audio path, because the model's history describes audio that this
+    /// stream is no longer continuing.
+    pub fn set_capture_active(&self, active: bool) -> Result<(), String> {
+        if self.capture_active.swap(active, Ordering::SeqCst) == active {
+            return Ok(());
+        }
+        if active {
+            // Before the stream can produce anything, so the first hop after a
+            // resume is not spliced onto the pre-pause tail.
+            self.shared.reset_audio();
+        }
+        let _lock = self.thread_loop.lock();
+        let streams = self.streams.borrow();
+        let Some(slot) = streams.capture.as_ref() else {
+            return Ok(());
+        };
+        slot.stream.set_active(active).map_err(|error| {
+            format!(
+                "could not {} the capture stream: {error}",
+                if active { "start" } else { "pause" }
+            )
+        })
     }
 
     /// Ask the graph for a small quantum while filtering, and for PipeWire's
@@ -1059,7 +1330,32 @@ fn state_changed(
     new: pw::stream::StreamState,
 ) {
     if let pw::stream::StreamState::Error(message) = &new {
-        shared.set_error(format!("PipeWire stream error: {message}"));
+        match role {
+            // The exported source is the whole point of the daemon: if it really
+            // dies there is nothing to fall back to. A missing target is not that
+            // — the node is exported, not linked, and PipeWire reports `ENOENT`
+            // for a link whose far end went away, which happens every time a
+            // microphone is unplugged underneath a running graph.
+            StreamRole::Source => {
+                if is_missing_target(message) {
+                    shared.note_capture_loss(format!("the graph lost a node: {message}"));
+                } else {
+                    shared.set_error(format!("PipeWire stream error: {message}"));
+                }
+            }
+            // Losing the microphone is not fatal: devices are unplugged, and
+            // Bluetooth headsets drop their links. PipeWire reports that as a
+            // stream `Error`, so the daemon is told instead of being killed, and
+            // it reconnects once the node is back in the registry.
+            StreamRole::Capture => {
+                shared.note_capture_loss(format!("the capture stream lost its device: {message}"));
+            }
+            // Headphones get unplugged. Taking the microphone down with them
+            // would be absurd, so this only stops monitoring.
+            StreamRole::Monitor => {
+                shared.note_monitor_failure(format!("Self-monitor stopped: {message}"));
+            }
+        }
         return;
     }
     if !matches!(role, StreamRole::Source) {
@@ -1068,6 +1364,17 @@ fn state_changed(
     if matches!(new, pw::stream::StreamState::Streaming) {
         on_source_started(shared);
     }
+}
+
+/// Whether PipeWire's error text means "the node I was linked to is gone".
+///
+/// `-ENOENT` is what the server reports when a link's far end disappears, and it
+/// is the difference between "the microphone was unplugged" — recoverable, the
+/// daemon keeps running and reconnects — and "this stream is broken", which for
+/// the exported node is fatal.
+fn is_missing_target(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("target not found") || message.contains("no such file")
 }
 
 fn registry_listener(
@@ -1217,9 +1524,15 @@ fn set_latency(props: &mut pw::properties::PropertiesBox, samples: u32) {
 
 /// Reported latency of one stream in milliseconds.
 ///
-/// `pw_time.rate` is the duration of one tick (1/48000 s for audio) and
-/// `delay`, `queued` and `buffered` are all counted in ticks, so the tick
-/// duration is the only conversion factor needed.
+/// `pw_time.rate` is the duration of one tick (1/48000 s for audio), and `delay`
+/// and `buffered` are counted in ticks, so the tick duration is the only
+/// conversion factor needed.
+///
+/// `queued` is deliberately not added. It is the sum of `pw_buffer.size`, a field
+/// the *application* has to set, and pipewire-rs exposes no setter for it, so it
+/// is always zero here. Including it would suggest a figure this code cannot
+/// produce; the daemon adds the ring's own depth to the total separately, where
+/// it knows the number.
 fn stream_latency_ms(stream: Option<&pw::stream::Stream>) -> Option<f64> {
     let time = stream?.time().ok()?;
     let time = time.as_raw();
@@ -1229,8 +1542,8 @@ fn stream_latency_ms(stream: Option<&pw::stream::Stream>) -> Option<f64> {
     let tick_ms = f64::from(time.rate.num) / f64::from(time.rate.denom) * 1000.0;
     // Output streams report the graph delay as negative.
     let graph = (time.delay as f64).abs() * tick_ms;
-    let queue = (time.queued + time.buffered) as f64 * tick_ms;
-    Some(graph + queue)
+    let buffer = time.buffered as f64 * tick_ms;
+    Some(graph + buffer)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1386,19 +1699,43 @@ impl TimingRing {
 }
 
 /// Single-producer single-consumer sample ring, lock-free.
+///
+/// The buffer is `UnsafeCell` rather than `Box<[f32]>` because both sides write
+/// to and read from it through shared references: the producer owns the range
+/// `[read, write)` and the consumer owns `[.., read)`, and the two never touch
+/// the same sample. That is the invariant [`Sync`] rests on, and it is why every
+/// access goes through [`UnsafeCell::get`] instead of a slice.
+///
+/// Which side a call belongs to is not a suggestion: `push` may only be called by
+/// the producer, and `pop`, `discard` and `clear` only by the consumer. In
+/// particular, asking a ring to drop its contents from a third thread would move
+/// the read index under the consumer's feet, so `Shared` asks for it with a
+/// counter (`request_reprime`) and the consumer does the discarding itself.
 pub mod ring {
+    use std::cell::UnsafeCell;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub struct Ring {
-        buffer: Box<[f32]>,
+        buffer: Box<[UnsafeCell<f32>]>,
         write: AtomicUsize,
         read: AtomicUsize,
     }
 
+    // Sound because the ring is single-producer single-consumer: `push` is only
+    // called by the thread that owns the write side, and `pop`/`discard`/`clear`
+    // only by the thread that owns the read side. The two indices are published
+    // with release/acquire ordering, so samples a producer writes are only read
+    // after the release store of `write`, and samples a consumer frees are only
+    // written after the release store of `read`.
+    unsafe impl Sync for Ring {}
+
     impl Ring {
         pub fn new(capacity: usize) -> Self {
             Self {
-                buffer: vec![0.0; capacity].into_boxed_slice(),
+                buffer: (0..capacity)
+                    .map(|_| UnsafeCell::new(0.0f32))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
                 write: AtomicUsize::new(0),
                 read: AtomicUsize::new(0),
             }
@@ -1410,18 +1747,25 @@ pub mod ring {
             write.wrapping_sub(read)
         }
 
+        /// Samples the ring can hold in total.
+        pub fn capacity(&self) -> usize {
+            self.buffer.len()
+        }
+
         pub fn push(&self, samples: &[f32]) -> bool {
             if self.len() + samples.len() > self.buffer.len() {
                 return false;
             }
             let mut write = self.write.load(Ordering::Relaxed);
-            for &sample in samples {
+            let mut rest = samples;
+            while !rest.is_empty() {
                 let index = write % self.buffer.len();
+                let take = rest.len().min(self.buffer.len() - index);
                 unsafe {
-                    let pointer = self.buffer.as_ptr().add(index) as *mut f32;
-                    pointer.write(sample);
+                    std::ptr::copy_nonoverlapping(rest.as_ptr(), self.buffer[index].get(), take);
                 }
-                write = write.wrapping_add(1);
+                write = write.wrapping_add(take);
+                rest = &rest[take..];
             }
             self.write.store(write, Ordering::Release);
             true
@@ -1444,13 +1788,21 @@ pub mod ring {
         pub fn pop(&self, samples: &mut [f32]) -> usize {
             let available = self.len().min(samples.len());
             let mut read = self.read.load(Ordering::Relaxed);
-            for slot in samples.iter_mut().take(available) {
-                *slot = self.buffer[read % self.buffer.len()];
-                read = read.wrapping_add(1);
+            let mut rest = &mut samples[..available];
+            while !rest.is_empty() {
+                let index = read % self.buffer.len();
+                let take = rest.len().min(self.buffer.len() - index);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.buffer[index].get(),
+                        rest.as_mut_ptr(),
+                        take,
+                    );
+                }
+                read = read.wrapping_add(take);
+                rest = &mut rest[take..];
             }
-            for slot in samples.iter_mut().skip(available) {
-                *slot = 0.0;
-            }
+            samples[available..].fill(0.0);
             self.read.store(read, Ordering::Release);
             available
         }

@@ -102,17 +102,18 @@ impl Notifier {
                         }
                     };
                     if job.toggle_action {
-                        match toggle_ids.lock() {
-                            Ok(mut ids) => {
-                                ids.push(id);
-                                if ids.len() > 32 {
-                                    ids.remove(0);
-                                }
-                            }
-                            Err(_) => {
-                                eprintln!("dfmic: notification action IDs lock poisoned");
-                                return Ok(());
-                            }
+                        // A poisoned lock means some other thread panicked while
+                        // holding it; the id list is not corrupt, just distrusted.
+                        // Recovering it keeps notifications working — returning
+                        // here would silently disable every future notification
+                        // for the life of the daemon.
+                        let mut ids = match toggle_ids.lock() {
+                            Ok(ids) => ids,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        ids.push(id);
+                        if ids.len() > 32 {
+                            ids.remove(0);
                         }
                     }
                 }

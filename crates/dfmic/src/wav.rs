@@ -34,23 +34,32 @@ pub fn read(path: &Path) -> Result<Wav, String> {
         let size =
             u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as usize;
         let body_start = pos + 8;
+        // A chunk may claim more bytes than the file holds: a truncated file is
+        // normal (a recording that was interrupted), so clamp rather than
+        // reject, but only ever hand out what is actually there.
         let body_end = body_start.saturating_add(size).min(buf.len());
+        let body = &buf[body_start..body_end];
         match id {
             b"fmt " => {
-                if size < 16 {
+                // The declared size and the bytes present are different things:
+                // a `fmt ` header claiming 16 bytes in a file that ends after 10
+                // must be an error, not an index panic.
+                if size < 16 || body.len() < 16 {
                     return Err("truncated fmt chunk".into());
                 }
-                let b = &buf[body_start..body_end];
-                let format = u16::from_le_bytes([b[0], b[1]]);
-                let channels = u16::from_le_bytes([b[2], b[3]]);
-                let rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-                let bits = u16::from_le_bytes([b[14], b[15]]);
+                let format = u16::from_le_bytes([body[0], body[1]]);
+                let channels = u16::from_le_bytes([body[2], body[3]]);
+                let rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                let bits = u16::from_le_bytes([body[14], body[15]]);
                 fmt = Some((format, channels, rate, bits));
             }
-            b"data" => data = Some(&buf[body_start..body_end]),
+            b"data" => data = Some(body),
             _ => {}
         }
-        pos = body_end + (size & 1);
+        // Chunks are word-aligned, so an odd size carries one pad byte. Advance
+        // past the *declared* size, not the clamped one: the next chunk starts
+        // where the file says it does, and a truncated body ends the loop.
+        pos = body_start.saturating_add(size).saturating_add(size & 1);
     }
 
     let (format, channels, rate, bits) = fmt.ok_or("missing fmt chunk")?;
@@ -60,11 +69,11 @@ pub fn read(path: &Path) -> Result<Wav, String> {
     }
 
     let mut mono = Vec::new();
-    let frames = match (format, bits) {
+    match (format, bits) {
         (1, 16) => {
             for frame in data.chunks_exact(2 * channels as usize) {
                 let mut acc = 0.0f32;
-                for c in frame.chunks_exact(2) {
+                for c in frame.as_chunks::<2>().0 {
                     acc += i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
                 }
                 mono.push(acc / channels as f32);
@@ -74,7 +83,7 @@ pub fn read(path: &Path) -> Result<Wav, String> {
         (1, 24) => {
             for frame in data.chunks_exact(3 * channels as usize) {
                 let mut acc = 0.0f32;
-                for c in frame.chunks_exact(3) {
+                for c in frame.as_chunks::<3>().0 {
                     let v = i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8;
                     acc += v as f32 / 8_388_608.0;
                 }
@@ -85,7 +94,7 @@ pub fn read(path: &Path) -> Result<Wav, String> {
         (1, 32) => {
             for frame in data.chunks_exact(4 * channels as usize) {
                 let mut acc = 0.0f32;
-                for c in frame.chunks_exact(4) {
+                for c in frame.as_chunks::<4>().0 {
                     acc += i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2_147_483_648.0;
                 }
                 mono.push(acc / channels as f32);
@@ -95,7 +104,7 @@ pub fn read(path: &Path) -> Result<Wav, String> {
         (3, 32) => {
             for frame in data.chunks_exact(4 * channels as usize) {
                 let mut acc = 0.0f32;
-                for c in frame.chunks_exact(4) {
+                for c in frame.as_chunks::<4>().0 {
                     acc += f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                 }
                 mono.push(acc / channels as f32);
@@ -108,7 +117,6 @@ pub fn read(path: &Path) -> Result<Wav, String> {
             ))
         }
     };
-    let _ = frames;
 
     Ok(Wav {
         sample_rate: rate,

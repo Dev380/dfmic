@@ -6,8 +6,13 @@ members = ["crates/dfn-dsp", "crates/dfn-npu", "crates/dfmic"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-# pipewire-rs requires 1.80.
-rust-version = "1.80"
+# The floor of the *default* (non-gui) graph, from the locked crates' own
+# rust-version fields: zbus 5.19 needs 1.87, and its unconditional `uuid` 1.29
+# dependency needs 1.89; pipewire-rs is the low one at 1.80.
+#
+# The `gui` feature raises this to 1.95 through Slint 1.19; it is optional, so it
+# does not belong here (see the comment on the feature in crates/dfmic/Cargo.toml).
+rust-version = "1.89"
 
 [workspace.dependencies]
 dfn-dsp = { path = "crates/dfn-dsp" }
@@ -19,4 +24,6 @@ realfft = "3"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Not `panic = "abort"`: the NPU worker runs inside `catch_unwind` so a panic in
+# inference becomes a recorded failure with a notification, instead of the
+# process vanishing and systemd restarting it with no explanation.

@@ -1,11 +1,14 @@
 //! `dfmic` — DeepFilterNet3_ll noise suppression on the Intel NPU.
 
+mod agc;
 mod cli;
 mod control;
 mod daemon;
 mod enhance;
 #[cfg(feature = "gui")]
 mod gui;
+mod models;
+mod modelwatch;
 mod notifications;
 mod proto;
 mod pw;
@@ -26,12 +29,13 @@ dfmic — DeepFilterNet3_ll virtual microphone on the Intel NPU
 
 usage:
   dfmic run     [--models DIR] [--device NPU] [--source NAME]
-                [--default-source auto|never] [PARAMETER VALUE ...]
+                [--default-source auto|never] [--PARAMETER VALUE ...]
   dfmic status  [--json]
   dfmic toggle | on | off
   dfmic set <key> <value>       live parameter (mask-reduce accepts names)
   dfmic reset [--all]
   dfmic source [list | default | <node name>]
+  dfmic models [download]       where the model is; `download` fetches it
   dfmic soft on|off
   dfmic agc on|off
   dfmic graph-quantum on|off   lower latency while filtering, at a little CPU
@@ -47,6 +51,7 @@ usage:
                 [--atten-lim DB] [--post-filter BETA]
                 [--min-thresh DB] [--max-erb-thresh DB] [--max-df-thresh DB]
                 [--min-buffer HOPS] [--mask-reduce none|max|mean]
+                [--agc] [--agc-trace]
   dfmic gui               the window (needs the gui feature)
 
 parameter keys:
@@ -54,7 +59,10 @@ parameter keys:
   min-buffer mask-reduce
 
 environment:
-  DFMIC_MODELS   directory holding enc.xml, erb_dec.xml, df_dec.xml
+  --models DIR   directory holding enc.xml, erb_dec.xml, df_dec.xml
+  DFMIC_MODELS   the same, from the environment
+  (with neither, the model is downloaded once into
+   $XDG_DATA_HOME/dfmic/models/DeepFilterNet3_ll-0.5.6)
 ";
 
 struct Args {
@@ -70,7 +78,7 @@ fn parse_args() -> Result<Args, String> {
     let mut flags = Vec::new();
     while let Some(arg) = argv.next() {
         if let Some(name) = arg.strip_prefix("--") {
-            if matches!(name, "help" | "json" | "all") {
+            if matches!(name, "help" | "json" | "all" | "agc" | "agc-trace") {
                 flags.push((name.to_string(), String::new()));
             } else {
                 let value = argv
@@ -101,14 +109,10 @@ impl Args {
         self.flags.iter().any(|(key, _)| key == name)
     }
 
+    /// Where the model is: `--models`, then `DFMIC_MODELS`, then the data
+    /// directory. Nothing is downloaded here; the error says how to get it.
     fn models(&self) -> Result<PathBuf, String> {
-        if let Some(dir) = self.flag("models") {
-            return Ok(PathBuf::from(dir));
-        }
-        if let Ok(dir) = std::env::var("DFMIC_MODELS") {
-            return Ok(PathBuf::from(dir));
-        }
-        Err("no model directory: pass --models DIR or set DFMIC_MODELS".into())
+        models::resolve(self.flag("models").map(PathBuf::from).as_deref())
     }
 
     fn device(&self) -> String {
@@ -181,12 +185,86 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let result = match args.command.as_str() {
+    let result = dispatch(&args);
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("dfmic: error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run the command in `args`, after rejecting flags it does not take.
+///
+/// Split from `main` so every arm is checked in one place: `parse_args` is
+/// deliberately permissive about what a flag *is*, and only the command knows
+/// which ones it reads.
+fn dispatch(args: &Args) -> Result<(), String> {
+    let allowed: &[&str] = match args.command.as_str() {
+        // The daemon takes the parameter keys as flags, so they are all valid.
+        "run" => &[
+            "models",
+            "device",
+            "source",
+            "default-source",
+            "atten-lim",
+            "post-filter",
+            "min-thresh",
+            "max-erb-thresh",
+            "max-df-thresh",
+            "min-buffer",
+            "mask-reduce",
+        ],
+        "doctor" => &["models", "device"],
+        "enhance" => &[
+            "models",
+            "device",
+            "atten-lim",
+            "post-filter",
+            "min-thresh",
+            "max-erb-thresh",
+            "max-df-thresh",
+            "min-buffer",
+            "mask-reduce",
+            "agc",
+            "agc-trace",
+        ],
+        "models" => &["models"],
+        "status" => &["json"],
+        "reset" => &["all"],
+        "set" => &[
+            "atten-lim",
+            "post-filter",
+            "min-thresh",
+            "max-erb-thresh",
+            "max-df-thresh",
+            "min-buffer",
+            "mask-reduce",
+        ],
+        "dump-features" => &["models"],
+        _ => &[],
+    };
+    // `--help` was handled before dispatch; everything else must be consumed.
+    let extra: Vec<&str> = args
+        .flags
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| *name != "help" && !allowed.contains(name))
+        .collect();
+    if let Some(name) = extra.first() {
+        return Err(format!(
+            "{} does not take --{name}\n\n{USAGE}",
+            args.command
+        ));
+    }
+    match args.command.as_str() {
         "doctor" => args
             .models()
             .and_then(|models| enhance::doctor(&models, &args.device())),
-        "enhance" => run_enhance(&args),
-        "run" => run_daemon(&args),
+        "enhance" => run_enhance(args),
+        "run" => run_daemon(args),
         "status" => cli::status(args.has("json")),
         "toggle" => cli::toggle(),
         "on" => cli::set_enabled(true),
@@ -196,6 +274,13 @@ fn main() -> ExitCode {
             _ => Err("set needs <key> <value>".into()),
         },
         "reset" => cli::reset(args.has("all")),
+        "models" => match args.positional.as_slice() {
+            [] => cli::models(args.flag("models").map(PathBuf::from).as_deref()),
+            [command] if command == "download" => {
+                cli::models_download(args.flag("models").map(PathBuf::from).as_deref())
+            }
+            _ => Err("models takes no argument, or `download`".into()),
+        },
         "source" if args.positional.len() <= 1 => {
             cli::source(args.positional.first().map(String::as_str))
         }
@@ -211,7 +296,7 @@ fn main() -> ExitCode {
         "service" if args.positional.as_slice() == ["start"] => cli::service_start(),
         "service" => Err("service supports only `dfmic service start`".into()),
         "gui" => run_gui(),
-        "dump-features" => run_dump_features(&args),
+        "dump-features" => run_dump_features(args),
         "replay-dsp" => {
             if args.positional.len() != 3 {
                 Err("replay-dsp needs <trace> <in.wav> <out.wav>".into())
@@ -224,14 +309,6 @@ fn main() -> ExitCode {
             }
         }
         other => Err(format!("unknown command {other:?}")),
-    };
-
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("dfmic: error: {error}");
-            ExitCode::FAILURE
-        }
     }
 }
 
@@ -285,7 +362,9 @@ fn run_daemon(args: &Args) -> Result<(), String> {
         }
     }
     daemon::run(&daemon::Options {
-        models: args.models()?,
+        // Deliberately not `models()`: the daemon runs without a model and
+        // downloads it on request, so a missing one must not stop startup.
+        models: models::path(args.flag("models").map(PathBuf::from).as_deref()),
         device: args.device(),
         source: args.flag("source").map(str::to_string),
         take_default,
@@ -303,5 +382,7 @@ fn run_enhance(args: &Args) -> Result<(), String> {
         models: args.models()?,
         device: args.device(),
         params: params_from(args)?,
+        agc: args.has("agc"),
+        agc_trace: args.has("agc-trace"),
     })
 }

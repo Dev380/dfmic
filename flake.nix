@@ -33,7 +33,7 @@
       # (engine, GUI) consumes this; nothing at runtime touches ONNX.
       models = pkgs.callPackage ./nix/models.nix {inherit python upstreamModel;};
       dfmic = pkgs.callPackage ./nix/package.nix {dfmic-models = models;};
-      default = self.packages.${pkgs.system}.dfmic;
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.dfmic;
     });
 
     devShells = eachSystem (pkgs: {
@@ -58,7 +58,7 @@
           pkgs.jq
         ];
         shellHook = ''
-          export DFMIC_MODELS=${self.packages.${pkgs.system}.models}
+          export DFMIC_MODELS=${self.packages.${pkgs.stdenv.hostPlatform.system}.models}
           # Hand-written OpenVINO FFI, and pipewire-sys links libpipewire
           # itself: both need the library directories on the native search path.
           export RUSTFLAGS="-L native=${pkgs.pipewire.dev}/lib -L native=${pkgs.openvino.lib}/lib"
@@ -66,14 +66,25 @@
           # dependency; without them `cargo run --features gui` dies with
           # "No default Slint platform was selected".
           export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [pkgs.wayland pkgs.libxkbcommon pkgs.libGL]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          echo "dfmic: model artifacts at $DFMIC_MODELS"
+          echo "dfmic: DFMIC_MODELS is exported, pointing at $DFMIC_MODELS"
         '';
       };
     });
 
     checks = eachSystem (pkgs: {
+      # The DSP tests are pure Rust (no model files), so the package's own
+      # `doCheck` compiles and runs them. This check is what makes a broken tree
+      # fail `nix flake check`: it builds the whole package, GUI included, and
+      # its tests with it. It was missing, so a tree with untracked modules
+      # passed the check while `nix build .#dfmic` failed.
+      package = self.packages.${pkgs.stdenv.hostPlatform.system}.dfmic;
+
       # Proves the stateful conversion reproduces the upstream stateless graphs.
-      # Fails the build if it drifts. CPU here so it also runs without an NPU.
+      # Fails the build if it drifts.
+      #
+      # CPU, not NPU: it compares against an FP32 CPU reference, so it has to run
+      # on the same kind of device and with the same precision, and it has to
+      # work on a machine with no NPU at all.
       parity = let
         python = mkPython pkgs;
       in
@@ -82,8 +93,8 @@
         } ''
           cp -r ${./tools/dfnpy} dfnpy
           python dfnpy/verify_convert.py \
-            --model-tar ${self.packages.${pkgs.system}.upstreamModel} \
-            --ir ${self.packages.${pkgs.system}.models} \
+            --model-tar ${self.packages.${pkgs.stdenv.hostPlatform.system}.upstreamModel} \
+            --ir ${self.packages.${pkgs.stdenv.hostPlatform.system}.models} \
             --device CPU --frames 60 --settle 10 | tee $out
         '';
     });

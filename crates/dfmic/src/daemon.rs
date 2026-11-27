@@ -7,13 +7,17 @@ use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use dfn_dsp::{DfnPipeline, Params, HOP_SIZE};
 use dfn_npu::NpuRuntime;
 
+use crate::agc::{self, Agc};
 use crate::control::{self, Command, ControlServer, Published, Reply, Request};
+use crate::models;
+use crate::modelwatch;
 use crate::notifications::{self, Notifier};
 use crate::proto::{
     Failure, MonitorTarget, Param, State, NODE_DESCRIPTION, NODE_NAME, SOFT_PRESET, SOURCE_DEFAULT,
@@ -24,6 +28,47 @@ use crate::settings::{self, DeviceSettings, Settings};
 
 const RATE: f64 = 48_000.0;
 const MODEL_DELAY_MS: f64 = HOP_SIZE as f64 / RATE * 1000.0;
+
+/// How long the worker blocks waiting for a hop while it is filtering.
+///
+/// Short on purpose: it only bounds how long a shutdown or a state change waits,
+/// because the capture callback wakes the futex as soon as a hop completes.
+const HOP_POLL: Duration = Duration::from_millis(2);
+/// How long the event loop waits for a request when everything is settled.
+///
+/// This is a poll: every iteration re-derives source availability, model state
+/// and the state machine, then publishes diagnostics if they are due. It is
+/// long on purpose, because a settled daemon should cost nothing — commands
+/// arrive through this very channel and wake it immediately, and every async
+/// source (the registry, the worker, a download, a signal) rings the same bell.
+///
+/// It matters that filtering is *not* settled: while the filter runs, the
+/// diagnostic counters change continuously and nothing else wakes the loop, so
+/// [`ACTIVE_POLL`] is used instead. The old single timeout meant the window's
+/// inference and overrun figures froze for half a minute at a time.
+const STEADY_POLL: Duration = Duration::from_secs(30);
+/// How long it waits while filtering, so the published counters track the audio.
+///
+/// The meters do not depend on this — `Levels()` is stateless and read directly —
+/// but `InferenceMs`, `Inferences`, `Overruns` and `Underruns` are properties, and
+/// they are only refreshed when the loop comes round. This is a *fifth* of a
+/// second rather than a tenth because the publish below is rate-limited to 100 ms
+/// anyway and the audio thread is what the CPU is for.
+const ACTIVE_POLL: Duration = Duration::from_millis(200);
+/// How long it waits while a start-up or a download is in flight.
+const BUSY_POLL: Duration = Duration::from_millis(50);
+/// How long it waits when the model is missing and cannot be watched.
+///
+/// Only used if `inotify` is unavailable: the watch normally wakes the loop the
+/// moment the files appear, so this is a fallback rather than a cadence.
+const MODEL_POLL: Duration = Duration::from_millis(2000);
+
+/// How long it blocks while nothing is listening.
+///
+/// Nothing feeds the ring then, so this is a sleep rather than a poll: the only
+/// thing that ends it is a consumer or the monitor arriving, and both wake the
+/// futex directly.
+const IDLE_POLL: Duration = Duration::from_millis(100);
 
 pub struct Options {
     pub models: PathBuf,
@@ -43,76 +88,6 @@ struct WorkerConfig {
 
 enum WorkerEvent {
     Failed(String),
-}
-
-struct Agc {
-    gain_db: f32,
-    limiter_gain: f32,
-    previous: f32,
-}
-
-impl Agc {
-    fn new() -> Self {
-        Self {
-            gain_db: 0.0,
-            limiter_gain: 1.0,
-            previous: 0.0,
-        }
-    }
-
-    fn process(
-        &mut self,
-        samples: &mut [f32],
-        lsnr: f32,
-        enabled: bool,
-        input_rms: f32,
-    ) -> (f32, bool) {
-        let voice = enabled && lsnr >= 0.0 && input_rms >= 10f32.powf(-50.0 / 20.0);
-        if enabled && voice && input_rms > 1e-7 {
-            let speech_target = 10f32.powf(-18.0 / 20.0);
-            let desired = (20.0 * (speech_target / input_rms).log10()).clamp(-12.0, 18.0);
-            // Roughly 0.5 s attack and 2 s release at one hop every 10 ms.
-            let coefficient = if desired > self.gain_db { 0.02 } else { 0.005 };
-            self.gain_db += (desired - self.gain_db) * coefficient;
-        }
-        let gain_db = if enabled { self.gain_db } else { 0.0 };
-        if !enabled {
-            self.gain_db = 0.0;
-        }
-        let gain = 10f32.powf(gain_db / 20.0);
-
-        // Causal four-times-oversampled peak detection. The detector has 2 dB
-        // of headroom for intersample overshoot and the final clamp enforces
-        // the -1 dBFS sample ceiling even for an abrupt full-scale transition.
-        let ceiling = 10f32.powf(-1.0 / 20.0);
-        let detector_ceiling = 10f32.powf(-3.0 / 20.0);
-        let mut previous = self.previous;
-        let mut limiter_gain = self.limiter_gain;
-        for sample in samples {
-            let gained = *sample * gain;
-            let mut true_peak = gained.abs();
-            for index in 1..4 {
-                let fraction = index as f32 / 4.0;
-                let interpolated = previous * (1.0 - fraction) + gained * fraction;
-                true_peak = true_peak.max(interpolated.abs());
-            }
-            let required = if true_peak > detector_ceiling {
-                detector_ceiling / true_peak
-            } else {
-                1.0
-            };
-            if required < limiter_gain {
-                limiter_gain = required;
-            } else {
-                limiter_gain = (limiter_gain + 0.00005).min(1.0);
-            }
-            *sample = (gained * limiter_gain).clamp(-ceiling, ceiling);
-            previous = gained;
-        }
-        self.previous = previous;
-        self.limiter_gain = limiter_gain;
-        (gain_db, voice)
-    }
 }
 
 /// Ask for realtime scheduling for the NPU worker, if the system allows it.
@@ -145,7 +120,9 @@ fn promote_to_realtime() {
 }
 
 fn worker_loop(
-    mut pipeline: DfnPipeline<NpuRuntime>,
+    mut pipeline: Option<DfnPipeline<NpuRuntime>>,
+    models: PathBuf,
+    device: String,
     shared: Arc<Shared>,
     config_rx: Receiver<WorkerConfig>,
     stop: Arc<AtomicBool>,
@@ -156,6 +133,13 @@ fn worker_loop(
         agc: true,
         params: Params::default(),
     };
+    // Kept separately from `config.params`: without a pipeline there is nothing
+    // to write them into, and they have to survive until there is.
+    let mut params = Params::default();
+    // How long to wait before looking for the model again, and the last error
+    // reported, so a broken model does not fill the log.
+    let mut next_load_check = Instant::now();
+    let mut last_load_error: Option<String> = None;
     let mut input = vec![0.0f32; HOP_SIZE];
     let mut output = vec![0.0f32; HOP_SIZE];
     let mut agc = Agc::new();
@@ -165,52 +149,123 @@ fn worker_loop(
             shared
                 .min_buffer
                 .store(next.params.min_buffer as usize, Ordering::Release);
-            *pipeline.params_mut() = next.params.clone();
+            params = next.params.clone();
+            if let Some(pipeline) = pipeline.as_mut() {
+                *pipeline.params_mut() = params.clone();
+            }
             config = next;
+        }
+        // The model may have been downloaded while we were running. Picking it
+        // up here, rather than at startup, is what lets the daemon run without
+        // one: it starts in pass-through and begins filtering once the files
+        // appear.
+        if pipeline.is_none() && Instant::now() >= next_load_check {
+            match NpuRuntime::load(&models, &device, None) {
+                Ok(runtime) => {
+                    let mut loaded = DfnPipeline::new(runtime, params.clone());
+                    // The rings may hold audio from before the model existed;
+                    // the model's history must not be spliced onto it.
+                    loaded.reset();
+                    pipeline = Some(loaded);
+                    shared.request_reprime();
+                    last_load_error = None;
+                    eprintln!("dfmic: model loaded; filtering is available");
+                }
+                Err(error) => {
+                    // Expected until the model is downloaded, so it is not a
+                    // failure: report it once, then look again in a while.
+                    if last_load_error.as_deref() != Some(error.as_str()) {
+                        eprintln!("dfmic: no model yet ({error})");
+                        last_load_error = Some(error);
+                    }
+                    next_load_check = Instant::now() + Duration::from_secs(5);
+                }
+            }
         }
         let next_reset = shared.reset_generation();
         if next_reset != reset_generation {
+            // Both ends of the pipeline, not just the rings: the STFT history,
+            // the normalisation states and the model's GRU and convolution
+            // history all describe audio that this stream is no longer
+            // continuing (a different device, or a restart).
             shared.input.clear();
-            shared.output.clear();
-            shared.monitor_output.clear();
+            shared.request_reprime();
+            if let Some(pipeline) = pipeline.as_mut() {
+                pipeline.reset();
+            }
             agc = Agc::new();
             reset_generation = next_reset;
         }
         let listening = shared.listening();
-        let should_process = listening && config.enabled && config.available;
-        let should_passthrough = listening && !config.enabled && config.available;
+        let filtering = config.enabled && config.available && pipeline.is_some();
+        let should_process = listening && filtering;
         if !config.available || !listening {
-            while shared.input.len() > 0 {
-                shared.input.pop(&mut input);
-            }
-            shared.output.clear();
-            shared.monitor_output.clear();
+            while shared.input.pop(&mut input) > 0 {}
+            shared.request_reprime();
             shared.set_agc(0.0, false);
-            thread::sleep(Duration::from_millis(2));
+            // The AGC's gain, floor and hold describe a session that has ended.
+            // Left alone, the first hop after a resume is boosted by a gain from
+            // hours ago and gated against a floor from another room.
+            agc = Agc::new();
+            // Nothing is recording from us and the capture callback is not
+            // feeding the ring, so there is nothing to poll for: sleep until the
+            // state changes. Whoever makes us listen again wakes this futex, so
+            // the timeout is only a safety net — and a long one is what makes an
+            // idle daemon cost nothing instead of 500 wakeups a second.
+            shared.wait_for_hop(IDLE_POLL);
             continue;
         }
         if shared.input.len() < HOP_SIZE {
             // The capture callback wakes us the moment a hop is complete, so
             // this returns within microseconds of the data arriving rather than
             // on the next poll tick.
-            shared.wait_for_hop();
+            shared.wait_for_hop(HOP_POLL);
             continue;
         }
+        // A failed shrink deepened the target; the pad was asked for here, by the
+        // only thread allowed to write this ring. Silence rather than a repeat of
+        // the last hop: the depth exists to absorb jitter, not to echo audio.
+        let pad = shared.take_pad();
+        if pad > 0 {
+            // A stack buffer, not an allocation: this is the audio worker, and
+            // the pad is bounded by one second of 48 kHz samples.
+            let silence = [0.0f32; 1024];
+            let mut left = pad;
+            while left > 0 {
+                let take = silence.len().min(left);
+                if !shared.output.push(&silence[..take]) {
+                    break;
+                }
+                left -= take;
+            }
+        }
         shared.input.pop(&mut input);
-        if should_passthrough {
-            output.copy_from_slice(&input);
-            shared.set_agc(0.0, false);
-        } else if should_process {
+        if should_process {
             let input_rms = (input.iter().map(|sample| sample * sample).sum::<f32>()
                 / input.len() as f32)
                 .sqrt();
             let started = Instant::now();
+            let Some(pipeline) = pipeline.as_mut() else {
+                unreachable!("should_process implies a pipeline")
+            };
             let lsnr = pipeline.process(&input, &mut output);
             shared.record_inference(started.elapsed().as_secs_f64());
-            let (gain, voice) = agc.process(&mut output, lsnr, config.agc, input_rms);
+            let (gain, voice) = agc.process(
+                &mut output,
+                agc::Hop {
+                    lsnr,
+                    input_rms,
+                    min_db_thresh: config.params.min_db_thresh,
+                },
+                config.agc,
+            );
             shared.set_agc(gain, voice);
         } else {
-            continue;
+            // Listening, but not filtering — either switched off or with no
+            // model yet: hand the microphone through untouched. Every other
+            // combination returned above.
+            output.copy_from_slice(&input);
+            shared.set_agc(0.0, false);
         }
         if shared.consumers.load(Ordering::Acquire) {
             let _ = shared.output.push(&output);
@@ -226,20 +281,20 @@ type WorkerHandle = (Sender<WorkerConfig>, Receiver<WorkerEvent>, JoinHandle<()>
 fn spawn_worker(
     models: PathBuf,
     device: String,
-    params: Params,
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
 ) -> Result<WorkerHandle, String> {
-    let runtime = NpuRuntime::load(&models, &device, None)?;
-    let pipeline = DfnPipeline::new(runtime, params);
+    // Loading happens inside the thread, not here: a missing model is a normal
+    // state (the daemon runs and passes audio through), not a startup failure.
     let (config_tx, config_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
+    let shared_for_wake = Arc::clone(&shared);
     let thread = thread::Builder::new()
         .name("dfmic-npu".into())
         .spawn(move || {
             promote_to_realtime();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker_loop(pipeline, shared, config_rx, stop);
+                worker_loop(None, models, device, shared, config_rx, stop);
             }));
             if let Err(panic) = result {
                 let message = panic
@@ -250,6 +305,9 @@ fn spawn_worker(
                 let _ = event_tx.send(WorkerEvent::Failed(format!(
                     "The NPU stopped while processing audio: {message}"
                 )));
+                // Nothing polls `worker_events` any more: the loop is asleep on
+                // its request channel, so it has to be told.
+                shared_for_wake.wake_loop();
             }
         })
         .map_err(|error| format!("could not start the NPU worker: {error}"))?;
@@ -315,6 +373,13 @@ fn recover_stale_default() -> Result<Option<String>, String> {
 struct Takeover {
     previous: Option<String>,
     active: bool,
+    /// The user overrode the default once, so stop taking it over.
+    ///
+    /// Without this the takeover re-runs on the next tick — `active` is false and
+    /// the current default is the user's choice — and overwrites both the default
+    /// and the record of the device we displaced. Enabling filtering again is
+    /// what clears it.
+    suppressed: bool,
 }
 
 impl Takeover {
@@ -325,14 +390,18 @@ impl Takeover {
             .ok()
             .and_then(|registry| registry.default_source.clone());
         if self.active && current.as_deref() != Some(NODE_NAME) {
-            // A user-selected default wins over our later clean-up and is not
-            // immediately overwritten by the next 50 ms state tick.
+            // The user picked a different default. Honour it: stop taking over
+            // and stop retrying, or this would fight the choice every tick. The
+            // device we displaced is still remembered — it is the backup file and
+            // `previous` — but it is no longer ours to restore, so the record is
+            // dropped deliberately.
             self.active = false;
             self.previous = None;
+            self.suppressed = true;
             remove_backup();
             return Ok(());
         }
-        if !should_take {
+        if !self.suppressed && !should_take {
             if self.active {
                 if current.as_deref() == Some(NODE_NAME) {
                     if let Some(previous) = self.previous.as_deref() {
@@ -345,7 +414,7 @@ impl Takeover {
             }
             return Ok(());
         }
-        if self.active || current.as_deref() == Some(NODE_NAME) {
+        if self.suppressed || self.active || current.as_deref() == Some(NODE_NAME) {
             return Ok(());
         }
         let Some(previous) = current.filter(|name| !name.is_empty()) else {
@@ -387,14 +456,60 @@ struct Daemon {
     /// The graph quantum currently requested, so we only talk to PipeWire when
     /// the answer changes. `None` means "leave the graph alone".
     low_latency: Option<bool>,
+    /// Whether the filter is on. Runtime state, never persisted: every start
+    /// begins with it off, so a login cannot silently take the microphone over.
+    enabled: bool,
+    /// Where the model is read from and downloaded into.
+    ///
+    /// Resolved once from `--models`/`DFMIC_MODELS`/the data directory and kept,
+    /// so `ModelPresent`, `ModelDownloadPossible` and the download itself all
+    /// answer about the same directory. Recomputed from the ambient environment
+    /// they would disagree with the worker, which loads from `options.models`.
+    models_root: PathBuf,
+    /// Whether the model files are on disk, refreshed every event-loop tick.
+    model_present: bool,
+    /// A download started by `DownloadModel()`, while it is still running.
+    model_download: Option<ModelDownload>,
+    /// Watches for the model appearing on disk, so a missing one does not have
+    /// to be polled for.
+    model_watch: Option<modelwatch::ModelWatch>,
+    /// The directory that watch is on.
+    ///
+    /// Kept so the watch can follow the tree downwards: the model directory is
+    /// usually created in several steps, and a watch on a distant ancestor only
+    /// reports the first one.
+    model_watch_root: Option<PathBuf>,
+}
+
+/// A model download running on its own thread.
+///
+/// The thread only reports through these two shared cells; the event loop polls
+/// them, so nothing touches the daemon's state from another thread.
+struct ModelDownload {
+    result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+}
+
+impl ModelDownload {
+    /// Take the outcome once the thread has finished, without blocking.
+    fn take(&self) -> Option<Result<PathBuf, String>> {
+        self.result.lock().ok().and_then(|mut slot| slot.take())
+    }
 }
 
 impl Daemon {
     fn new(
         options: Options,
         restored: Option<String>,
+        control: ControlServer,
+        shared: Arc<Shared>,
+        sender: Sender<Request>,
+        requests: Receiver<Request>,
     ) -> Result<(Self, Receiver<Request>), String> {
         let (mut settings, mut notices) = settings::load()?;
+        // The one directory every model question is asked about. `options.models`
+        // has already been resolved from `--models`/`DFMIC_MODELS`/the data
+        // directory by the caller, so it is the same path the worker loads from.
+        let models_root = options.models.clone();
         if let Some(source) = &options.source {
             settings.source = Some(source.clone());
         }
@@ -404,7 +519,6 @@ impl Daemon {
         let initial_source = settings.source.clone().unwrap_or_default();
         let following = initial_source == SOURCE_DEFAULT;
 
-        let shared = Shared::new(48_000 / 2);
         let bridge = Bridge::start(
             NODE_NAME,
             NODE_DESCRIPTION,
@@ -494,17 +608,9 @@ impl Daemon {
         let (worker, worker_events, worker_thread) = spawn_worker(
             options.models.clone(),
             options.device.clone(),
-            device_settings.effective_params(),
             Arc::clone(&shared),
             Arc::clone(&worker_stop),
         )?;
-        let (sender, receiver) = control::channel();
-        let mut published = Published::initial(options.device.clone());
-        published.last_failure = service::last_failure().unwrap_or(Failure {
-            message: String::new(),
-            when: 0,
-            phase: String::new(),
-        });
         let autostart = if !service::unit_installed() {
             false
         } else {
@@ -516,8 +622,6 @@ impl Daemon {
                 }
             }
         };
-        published.autostart = autostart;
-        let control = ControlServer::start(sender.clone(), Arc::clone(&shared), published)?;
         let notifier = Notifier::new(control.connection(), sender);
         if settings.notify {
             if let Some(previous) = &restored {
@@ -531,9 +635,27 @@ impl Daemon {
             }
         }
         let terminate = Arc::new(AtomicBool::new(false));
-        for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-            signal_hook::flag::register(signal, Arc::clone(&terminate))
-                .map_err(|error| format!("could not install termination handler: {error}"))?;
+        // A flag alone is not enough now that the loop sleeps on its channel: a
+        // signal has to wake it as well, or SIGTERM would sit unread for as long
+        // as the safety timeout. The iterator owns a self-pipe, so this thread
+        // blocks in `read` rather than polling.
+        {
+            let mut signals = signal_hook::iterator::Signals::new([
+                signal_hook::consts::SIGINT,
+                signal_hook::consts::SIGTERM,
+            ])
+            .map_err(|error| format!("could not install termination handler: {error}"))?;
+            let terminate = Arc::clone(&terminate);
+            let wake = Arc::clone(&shared);
+            thread::Builder::new()
+                .name("dfmic-signals".into())
+                .spawn(move || {
+                    for _ in signals.forever() {
+                        terminate.store(true, Ordering::SeqCst);
+                        wake.wake_loop();
+                    }
+                })
+                .map_err(|error| format!("could not start the signal thread: {error}"))?;
         }
         let mut daemon = Self {
             options,
@@ -551,6 +673,7 @@ impl Daemon {
             takeover: Takeover {
                 previous: None,
                 active: false,
+                suppressed: false,
             },
             last_failure: service::last_failure().unwrap_or(Failure {
                 message: String::new(),
@@ -564,11 +687,19 @@ impl Daemon {
             monitor_stream: None,
             last_sink: String::new(),
             low_latency: None,
+            enabled: false,
+            models_root: models_root.clone(),
+            model_present: models::is_ready(Some(&models_root)),
+            model_download: None,
+            model_watch: None,
+            model_watch_root: None,
         };
         daemon.send_worker_config();
         daemon.sync_monitor()?;
         daemon.sync_state()?;
-        Ok((daemon, receiver))
+        // Replace the "starting" state published above with the real one.
+        daemon.control.publish(daemon.snapshot(), true);
+        Ok((daemon, requests))
     }
 
     fn current_device(&self) -> DeviceSettings {
@@ -621,7 +752,12 @@ impl Daemon {
             return Ok(());
         }
         self.resolved = next;
-        self.bridge.set_source(&self.resolved)?;
+        // Best effort: a device that vanished a moment ago is retried by the
+        // availability check on the next tick, and one that is gone must not take
+        // the daemon with it.
+        if let Err(error) = self.bridge.set_source(&self.resolved) {
+            self.notice(format!("Could not open {}: {error}", self.resolved));
+        }
         self.shared.reset_audio();
         self.settings
             .devices
@@ -644,9 +780,123 @@ impl Daemon {
         Ok(())
     }
 
+    /// Start fetching the model, on a thread of its own.
+    ///
+    /// The daemon is the only thing that downloads: the window asks over the
+    /// bus, so there is one place that knows where the files go and one place
+    /// that decides whether a download is possible at all.
+    fn start_model_download(&mut self) -> Result<(), String> {
+        if self.model_download.is_some() {
+            return Err("A model download is already running.".into());
+        }
+        if self.model_present {
+            return Ok(());
+        }
+        if !models::downloadable() {
+            return Err(
+                "This build has no model download URL configured, so it cannot fetch one.\n\
+                 Pass --models DIR or set DFMIC_MODELS to a directory holding the model."
+                    .into(),
+            );
+        }
+        if !models::can_download(Some(&self.models_root)) {
+            return Err(format!(
+                "Cannot write the model to {}.\n\
+                 Pass --models DIR or set DFMIC_MODELS to somewhere writable.",
+                self.models_root.display()
+            ));
+        }
+        let result = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&result);
+        let wake = Arc::clone(&self.shared);
+        let root = self.models_root.clone();
+        thread::Builder::new()
+            .name("dfmic-model".into())
+            .spawn(move || {
+                let outcome = models::download_default(Some(&root));
+                if let Ok(mut slot) = slot.lock() {
+                    *slot = Some(outcome);
+                }
+                // The loop is asleep; tell it there is an outcome to collect.
+                wake.wake_loop();
+            })
+            .map_err(|error| format!("could not start the model download: {error}"))?;
+        self.model_download = Some(ModelDownload { result });
+        self.sync_state()?;
+        Ok(())
+    }
+
+    /// Watch for the model appearing on disk, while it is missing.
+    ///
+    /// Started only in the missing state: once the files are there the daemon has
+    /// nothing left to wait for, and a watch that never fires is just a thread.
+    fn sync_model_watch(&mut self) {
+        if self.model_present {
+            self.model_watch = None;
+            self.model_watch_root = None;
+            return;
+        }
+        // Watch the deepest directory that exists. Each time one more level
+        // appears this moves down, so a model directory created in several steps
+        // is followed rather than only noticing its first step.
+        let root = modelwatch::watch_root(&self.models_root);
+        if self.model_watch_root.as_deref() == Some(root.as_path()) && self.model_watch.is_some() {
+            return;
+        }
+        // Remembered even when the watch fails, so a machine without inotify does
+        // not re-create one and re-log the same warning every ``MODEL_POLL`` for
+        // as long as the model is missing.
+        let attempted =
+            self.model_watch_root.as_deref() == Some(root.as_path()) && self.model_watch.is_none();
+        if attempted {
+            return;
+        }
+        self.model_watch = None;
+        let wake = Arc::clone(&self.shared);
+        self.model_watch = modelwatch::ModelWatch::start(&root, move || wake.wake_loop());
+        // The root is recorded whether or not the watch started: it is what tells
+        // the next tick whether this has already been tried.
+        self.model_watch_root = Some(root.clone());
+        if self.model_watch.is_none() {
+            // No inotify, or nothing watchable yet. The loop keeps its periodic
+            // look as a fallback, so this is a lost optimisation, not a failure.
+            eprintln!(
+                "dfmic: cannot watch {} for a model; falling back to polling",
+                root.display()
+            );
+        }
+    }
+
+    /// Notice a finished download, and the model appearing by any other route.
+    fn sync_model(&mut self) {
+        let finished = self.model_download.as_ref().and_then(ModelDownload::take);
+        if let Some(outcome) = finished {
+            self.model_download = None;
+            match outcome {
+                Ok(dir) => {
+                    self.model_present = true;
+                    self.notify(
+                        "Model installed",
+                        &format!("Filtering is available. Saved to {}.", dir.display()),
+                        false,
+                    );
+                }
+                Err(error) => {
+                    self.model_present = models::is_ready(Some(&self.models_root));
+                    self.notify("Could not download the model", &error, false);
+                }
+            }
+        }
+        // `dfmic models download` run by hand, or a file dropped in place: the
+        // daemon picks it up on its own.
+        if !self.model_present && models::is_ready(Some(&self.models_root)) {
+            self.model_present = true;
+        }
+    }
+
     fn send_worker_config(&self) {
         let config = WorkerConfig {
-            enabled: self.settings.enabled,
+            enabled: self.enabled,
             available: self.source_available,
             agc: self.settings.agc,
             params: self.current_device().effective_params(),
@@ -660,9 +910,12 @@ impl Daemon {
     }
 
     fn sync_state(&mut self) -> Result<(), String> {
-        let next = if !self.source_available {
+        let next = if !self.model_present {
+            // Nothing can be filtered without the model, whatever else is true.
+            State::NoModel
+        } else if !self.source_available {
             State::NoDevice
-        } else if !self.settings.enabled {
+        } else if !self.enabled {
             State::Off
         } else if self.shared.listening() && self.bridge.ready() {
             State::Filtering
@@ -676,15 +929,38 @@ impl Daemon {
         // PipeWire sizes the whole graph from the smallest latency any client
         // asks for, so this is only requested while we are actually filtering
         // and is handed back the moment we stop.
+        // Capture is needed whenever somebody could hear something: filtering,
+        // or the pass-through an app gets while we are on but idle. With nothing
+        // listening and the filter off there is no one to hear it, so the stream
+        // is paused and the graph costs nothing; the window's own capture keeps
+        // the input meter alive while the daemon is silent.
+        let capture = match next {
+            State::Filtering | State::Idle | State::NoDevice | State::Starting => true,
+            State::Off | State::NoModel => self.shared.listening(),
+        };
+        self.bridge.set_capture_active(capture)?;
         let low_latency = Some(self.settings.graph_quantum && next == State::Filtering);
         if low_latency != self.low_latency {
             self.bridge.set_low_latency(low_latency == Some(true))?;
             self.low_latency = low_latency;
         }
+        // The old depth describes a session that has ended. Handing it back when
+        // the filter stops is what makes each start begin at the measured floor.
+        if next != State::Filtering {
+            self.shared.reset_delay();
+        }
         self.takeover.sync(
             &self.bridge,
             &self.shared,
-            self.settings.take_default && self.settings.enabled && self.source_available,
+            // While filtering, which is what the contract promises: taking the
+            // system default away from the real microphone to hand every app a
+            // device that is not filtering would only add a hop of latency to
+            // nothing. Without a model there is nothing to filter at all.
+            self.settings.take_default
+                && self.enabled
+                && self.source_available
+                && self.model_present
+                && next == State::Filtering,
         )
     }
 
@@ -706,10 +982,39 @@ impl Daemon {
             self.shared.set_monitor_active(desired.is_some());
             self.monitor_stream = desired;
         }
-        if target.name != self.last_sink {
-            self.last_sink = target.name;
+        // Monitoring plays the microphone into the speakers, so it is only ever
+        // on for headphones. That was enforced once at startup, which left it
+        // playing acoustically after the default output changed to the speakers
+        // mid-session. Checked again whenever the sink changes.
+        self.last_sink = target.name;
+        if self.settings.monitor && !matches!(target.kind.as_str(), "headphones" | "unknown") {
+            self.settings.monitor = false;
+            self.persist()?;
+            self.notices.push(format!(
+                "Self-monitor turned off: the default output is now {} ({}).",
+                if target.description.is_empty() {
+                    "an unknown output"
+                } else {
+                    &target.description
+                },
+                target.kind
+            ));
+            self.bridge.set_monitor(false, None)?;
+            self.shared.set_monitor_active(false);
+            self.monitor_stream = None;
         }
         Ok(())
+    }
+
+    /// Add a note for the window, unless it is already the last one.
+    ///
+    /// These are produced from inside the event loop, which runs several times a
+    /// second while a device is missing: without this the list would grow without
+    /// bound and the `NoticeChanged` signal would fire on every tick.
+    fn notice(&mut self, message: String) {
+        if self.notices.last() != Some(&message) {
+            self.notices.push(message);
+        }
     }
 
     fn persist(&self) -> Result<(), String> {
@@ -723,9 +1028,8 @@ impl Daemon {
     }
 
     fn set_enabled(&mut self, enabled: bool) -> Result<(), String> {
-        let changed = self.settings.enabled != enabled;
-        self.settings.enabled = enabled;
-        self.persist()?;
+        let changed = self.enabled != enabled;
+        self.enabled = enabled;
         self.shared.reset_audio();
         self.send_worker_config();
         self.sync_state()?;
@@ -751,7 +1055,16 @@ impl Daemon {
         if name == SOURCE_DEFAULT {
             self.settings.source = Some(SOURCE_DEFAULT.into());
             self.follow_default_source()?;
-            self.source_available = !self.resolved.is_empty();
+            // Asked of the registry, not inferred from a non-empty name: while
+            // following the default the resolved name can outlive the device it
+            // names, and reporting it as available made `State` say `idle` while
+            // `SourceAvailable` said no.
+            self.source_available = !self.resolved.is_empty()
+                && self
+                    .shared
+                    .registry
+                    .lock()
+                    .is_ok_and(|registry| registry.source(&self.resolved).is_some());
             self.settings
                 .devices
                 .entry(self.resolved.clone())
@@ -796,12 +1109,26 @@ impl Daemon {
         // callback while holding the loop lock, so the two deadlock against each
         // other.
         let (selected, devices, monitor_target) = {
-            let registry = self.shared.registry.lock().expect("registry lock poisoned");
-            (
-                registry.source(&source),
-                registry.devices(),
-                registry.monitor_target(),
-            )
+            // Not `expect`: every other registry acquisition in the daemon
+            // degrades on a poisoned lock, and a panic here — the function runs
+            // on every request and every tick — would take the whole daemon down
+            // because a PipeWire callback panicked once.
+            match self.shared.registry.lock() {
+                Ok(registry) => (
+                    registry.source(&source),
+                    registry.devices(),
+                    registry.monitor_target(),
+                ),
+                Err(_) => (
+                    None,
+                    Vec::new(),
+                    MonitorTarget {
+                        name: String::new(),
+                        description: String::new(),
+                        kind: "unknown".into(),
+                    },
+                ),
+            }
         };
         let device = self.current_device();
         let listening = self.shared.listening();
@@ -822,11 +1149,7 @@ impl Daemon {
                             as f64)
                         / RATE
                         * 1000.0;
-                    let model = if self.settings.enabled {
-                        MODEL_DELAY_MS
-                    } else {
-                        0.0
-                    };
+                    let model = if self.enabled { MODEL_DELAY_MS } else { 0.0 };
                     // Deliberately *not* part of the total: inference time is
                     // absorbed by the buffered audio that plays while the NPU
                     // works, so adding it would count the same milliseconds
@@ -847,7 +1170,7 @@ impl Daemon {
             };
         Published {
             state: self.state.as_str().into(),
-            enabled: self.settings.enabled,
+            enabled: self.enabled,
             listening,
             source_description: selected
                 .as_ref()
@@ -855,6 +1178,10 @@ impl Daemon {
                 .unwrap_or_default(),
             source_available: selected.is_some(),
             source_following: self.following(),
+            model_present: self.model_present,
+            model_path: self.models_root.to_string_lossy().into_owned(),
+            model_downloading: self.model_download.is_some(),
+            model_download_possible: models::can_download(Some(&self.models_root)),
             source,
             devices: devices
                 .into_iter()
@@ -892,8 +1219,8 @@ impl Daemon {
         let command = request.command.clone();
         let result: Result<Reply, String> = match command.clone() {
             Command::Toggle => self
-                .set_enabled(!self.settings.enabled)
-                .map(|()| Reply::Bool(self.settings.enabled)),
+                .set_enabled(!self.enabled)
+                .map(|()| Reply::Bool(self.enabled)),
             Command::SetEnabled(enabled) => self.set_enabled(enabled).map(|()| Reply::None),
             Command::SetParam(key, value) => (|| {
                 let param =
@@ -916,8 +1243,11 @@ impl Daemon {
                     ));
                 }
                 device.set(param, value);
-                self.persist()?;
+                // Push to the worker before writing the file: if the save fails
+                // the caller is told so, but the running filter must already be
+                // using what the published properties now report.
                 self.send_worker_config();
+                self.persist()?;
                 Ok(Reply::None)
             })(),
             Command::ResetParams => (|| {
@@ -925,8 +1255,8 @@ impl Daemon {
                 self.settings
                     .devices
                     .insert(source, DeviceSettings::default());
-                self.persist()?;
                 self.send_worker_config();
+                self.persist()?;
                 Ok(Reply::None)
             })(),
             Command::SetSoftMode(on) => (|| {
@@ -936,15 +1266,15 @@ impl Daemon {
                     .get_mut(&source)
                     .ok_or("No capture device is selected.")?
                     .soft = on;
-                self.persist()?;
                 self.send_worker_config();
+                self.persist()?;
                 Ok(Reply::None)
             })(),
             Command::SetSource(name) => self.set_source(name).map(|()| Reply::None),
             Command::SetAgc(on) => (|| {
                 self.settings.agc = on;
-                self.persist()?;
                 self.send_worker_config();
+                self.persist()?;
                 Ok(Reply::None)
             })(),
             Command::SetGraphQuantum(on) => (|| {
@@ -995,14 +1325,20 @@ impl Daemon {
                 self.settings = Settings::default();
                 self.settings.source = (!source.is_empty()).then_some(source.clone());
                 self.notices.clear();
+                // A reset is the user asking for the defaults; whatever stopped
+                // the takeover earlier is part of what is being reset.
+                self.takeover.suppressed = false;
                 if !source.is_empty() {
                     self.bridge.set_source(&source)?;
                 }
                 self.settings.devices.entry(source.clone()).or_default();
                 self.source_available = !source.is_empty();
                 self.shared.reset_audio();
-                self.persist()?;
+                // Everything the daemon acts on is applied before the file is
+                // written: a reset that cannot be saved is still a reset in
+                // effect, and the caller hears about the save separately.
                 self.send_worker_config();
+                self.persist()?;
                 self.sync_monitor()?;
                 self.sync_state()?;
                 Ok(Reply::None)
@@ -1011,6 +1347,9 @@ impl Daemon {
                 self.notices.clear();
                 Ok(Reply::None)
             }
+            Command::DownloadModel => self.start_model_download().map(|()| Reply::None),
+            // A nudge, not a request: the tick that follows this does the work.
+            Command::Wake => Ok(Reply::None),
             Command::ClearFailure => {
                 service::clear_last_failure();
                 self.last_failure = Failure {
@@ -1021,11 +1360,14 @@ impl Daemon {
                 Ok(Reply::None)
             }
         };
+        // Publish before replying. `dfmic toggle` and `set_enabled` read the
+        // properties back as soon as the call returns, so a reply sent first races
+        // the client against the state it just changed.
+        self.control.publish(self.snapshot(), false);
         match result {
             Ok(reply) => request.succeed(reply),
             Err(message) => request.fail(message),
         }
-        self.control.publish(self.snapshot(), false);
     }
 
     fn event_loop(&mut self, requests: &Receiver<Request>) -> Result<(), String> {
@@ -1033,7 +1375,21 @@ impl Daemon {
         let mut last_volatile = Instant::now() - Duration::from_secs(1);
         let mut previous_available = self.source_available;
         while !self.terminate.load(Ordering::Acquire) {
-            match requests.recv_timeout(Duration::from_millis(50)) {
+            // Every source of change rings this channel: commands from the bus,
+            // PipeWire's registry and metadata callbacks, the worker, a finished
+            // download, and the signal handler. So the loop only has to poll
+            // while something is in flight, and can otherwise sleep for a long
+            // time — the timeout is a safety net, not a cadence.
+            let poll = if self.state == State::Starting || self.model_download.is_some() {
+                BUSY_POLL
+            } else if self.state == State::Filtering {
+                ACTIVE_POLL
+            } else if !self.model_present && self.model_watch.is_none() {
+                MODEL_POLL
+            } else {
+                STEADY_POLL
+            };
+            match requests.recv_timeout(poll) {
                 Ok(request) => self.handle(request),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1046,6 +1402,30 @@ impl Daemon {
             if let Some(error) = self.shared.error() {
                 return Err(format!("PipeWire failed: {error}"));
             }
+            if let Some(failure) = self.shared.take_monitor_failure() {
+                // A sink that will not open is not a reason to take the
+                // microphone down, and retrying it every tick would only churn
+                // streams. Turn monitoring off and say why; the user can turn it
+                // back on once the output is there.
+                self.notices.push(failure);
+                if self.settings.monitor {
+                    self.settings.monitor = false;
+                    self.persist()?;
+                    self.sync_monitor()?;
+                }
+            }
+            // The capture stream lost its device. Not fatal, and not something
+            // waiting helps with: the stream is left alone here and the
+            // availability check below decides, because the registry can still
+            // name a node the server has just destroyed. Pointing a stream at one
+            // is how "the microphone was unplugged" used to become "the daemon
+            // exited".
+            if let Some(loss) = self.shared.take_capture_loss() {
+                self.notice(format!(
+                    "Microphone capture dropped ({loss}); waiting for it to return."
+                ));
+                self.shared.reset_audio();
+            }
             self.follow_default_source()?;
             let source = self.resolved.clone();
             self.source_available = !source.is_empty()
@@ -1056,7 +1436,9 @@ impl Daemon {
                     .is_ok_and(|registry| registry.source(&source).is_some());
             if self.source_available != previous_available {
                 if self.source_available {
-                    self.bridge.set_source(&source)?;
+                    if let Err(error) = self.bridge.set_source(&source) {
+                        self.notice(format!("Could not open {source}: {error}"));
+                    }
                     self.shared.reset_audio();
                     self.notify(
                         "Microphone reconnected",
@@ -1076,8 +1458,14 @@ impl Daemon {
                 self.send_worker_config();
                 self.sync_state()?;
             }
+            self.sync_model();
+            self.sync_model_watch();
             self.sync_monitor()?;
             self.sync_state()?;
+            // Diagnostics are properties, so they only reach a client when this
+            // runs. The loop's timeout is the cadence: `ACTIVE_POLL` while
+            // filtering, because nothing else wakes it and a half-minute gap made
+            // the window's inference and overrun counters look frozen.
             if last_publish.elapsed() >= Duration::from_millis(100) {
                 self.control.publish(
                     self.snapshot(),
@@ -1093,17 +1481,20 @@ impl Daemon {
     }
 
     fn shutdown(&mut self) {
-        let enabled = self.settings.enabled;
-        self.settings.enabled = false;
+        let enabled = self.enabled;
+        self.enabled = false;
         if let Err(error) = self.sync_state() {
             eprintln!("dfmic: could not restore the previous default source: {error}");
         }
-        self.settings.enabled = enabled;
+        self.enabled = enabled;
         if let Err(error) = self.bridge.set_monitor(false, None) {
             eprintln!("dfmic: could not stop self-monitor: {error}");
         }
         self.shared.set_monitor_active(false);
         self.worker_stop.store(true, Ordering::Release);
+        // It may be in its long idle sleep; without this the join below waits
+        // for that timeout to expire.
+        self.shared.wake_worker();
         if let Some(thread) = self.worker_thread.take() {
             if thread.join().is_err() {
                 eprintln!("dfmic: NPU worker panicked during shutdown");
@@ -1130,11 +1521,36 @@ fn validate_param(param: Param, value: f64) -> Result<(), String> {
 }
 
 pub fn run(options: &Options) -> Result<(), String> {
+    // Take the bus name before anything with a side effect on the running
+    // system — restoring the previous default source, creating PipeWire streams,
+    // loading the NPU — because a second instance doing any of them would
+    // sabotage the first one before it discovered that it is not allowed to
+    // exist. The interface is exported first so that the name only becomes
+    // visible once it can be answered.
+    let shared = Shared::new();
+    let (sender, requests) = control::channel();
+    // Every asynchronous source of change nudges this: PipeWire's callbacks (via
+    // `Shared::wake_loop`), the worker, the download thread and the signals.
+    shared.set_wake_sender(sender.clone());
+    let control = ControlServer::connect()?
+        .start(
+            sender.clone(),
+            Arc::clone(&shared),
+            Published::initial(options.device.clone()),
+        )?
+        .claim()?;
     let restored = match recover_stale_default() {
         Ok(restored) => restored,
         Err(error) => return startup_failure(error),
     };
-    let (mut daemon, requests) = match Daemon::new(options.clone_for_startup(), restored) {
+    let (mut daemon, requests) = match Daemon::new(
+        options.clone_for_startup(),
+        restored,
+        control,
+        shared,
+        sender,
+        requests,
+    ) {
         Ok(daemon) => daemon,
         Err(error) => return startup_failure(error),
     };

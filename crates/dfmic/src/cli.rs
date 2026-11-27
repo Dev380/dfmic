@@ -15,6 +15,9 @@ struct Status {
     source_description: String,
     source_available: bool,
     source_following: bool,
+    model_present: bool,
+    model_downloading: bool,
+    model_download_possible: bool,
     devices: Vec<Device>,
     compute_device: String,
     levels: Levels,
@@ -53,6 +56,19 @@ fn daemon_error(context: &str, error: impl std::fmt::Display) -> String {
     message
 }
 
+/// A failed method call, as the user should see it.
+///
+/// The daemon's errors carry a plain-language sentence (`proto.rs` promises a
+/// client may show it verbatim), but `zbus::Error`'s `Display` prefixes it with
+/// `org.freedesktop.DBus.Error.Failed: `. That prefix is noise in a terminal, so
+/// it is stripped here; everything else is passed through unchanged.
+fn method_error(error: zbus::Error) -> String {
+    match error {
+        zbus::Error::MethodError(_, Some(message), _) if !message.is_empty() => message,
+        other => other.to_string(),
+    }
+}
+
 fn with_proxy<T>(
     operation: impl FnOnce(&ControlProxyBlocking<'_>) -> Result<T, String>,
 ) -> Result<T, String> {
@@ -79,6 +95,9 @@ fn read_status(proxy: &ControlProxyBlocking<'_>) -> Result<Status, String> {
         source_description: get!(source_description),
         source_available: get!(source_available),
         source_following: get!(source_following),
+        model_present: get!(model_present),
+        model_downloading: get!(model_downloading),
+        model_download_possible: get!(model_download_possible),
         devices: get!(devices),
         compute_device: get!(compute_device),
         levels: get!(levels),
@@ -240,8 +259,8 @@ fn status_inner(proxy: &ControlProxyBlocking<'_>, json: bool) -> Result<(), Stri
 }
 
 fn print_state(proxy: &ControlProxyBlocking<'_>) -> Result<(), String> {
-    let enabled = proxy.enabled().map_err(|error| error.to_string())?;
-    let state = proxy.state().map_err(|error| error.to_string())?;
+    let enabled = proxy.enabled().map_err(method_error)?;
+    let state = proxy.state().map_err(method_error)?;
     State::parse(&state).ok_or_else(|| format!("daemon returned an unknown state {state:?}"))?;
     println!("enabled: {enabled}; state: {state}");
     Ok(())
@@ -249,16 +268,14 @@ fn print_state(proxy: &ControlProxyBlocking<'_>) -> Result<(), String> {
 
 pub fn toggle() -> Result<(), String> {
     with_proxy(|proxy| {
-        proxy.toggle().map_err(|error| error.to_string())?;
+        proxy.toggle().map_err(method_error)?;
         print_state(proxy)
     })
 }
 
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
     with_proxy(|proxy| {
-        proxy
-            .set_enabled(enabled)
-            .map_err(|error| error.to_string())?;
+        proxy.set_enabled(enabled).map_err(method_error)?;
         print_state(proxy)
     })
 }
@@ -279,9 +296,7 @@ pub fn set_param(key: &str, value: &str) -> Result<(), String> {
             .map_err(|_| format!("{key} expects a number; got {value:?}"))?
     };
     with_proxy(|proxy| {
-        proxy
-            .set_param(key, value)
-            .map_err(|error| error.to_string())?;
+        proxy.set_param(key, value).map_err(method_error)?;
         println!("{key} = {value}");
         Ok(())
     })
@@ -293,10 +308,10 @@ pub fn reset(all: bool) -> Result<(), String> {
 
 fn reset_inner(proxy: &ControlProxyBlocking<'_>, all: bool) -> Result<(), String> {
     if all {
-        proxy.reset_all().map_err(|error| error.to_string())?;
+        proxy.reset_all().map_err(method_error)?;
         println!("All settings and per-device parameters were reset (autostart unchanged).");
     } else {
-        proxy.reset_params().map_err(|error| error.to_string())?;
+        proxy.reset_params().map_err(method_error)?;
         println!("Current device parameters were reset and soft mode was turned off.");
     }
     Ok(())
@@ -309,27 +324,27 @@ pub fn source(argument: Option<&str>) -> Result<(), String> {
 fn source_inner(proxy: &ControlProxyBlocking<'_>, argument: Option<&str>) -> Result<(), String> {
     match argument {
         None => {
-            let following = proxy.source_following().map_err(|e| e.to_string())?;
+            let following = proxy.source_following().map_err(method_error)?;
             println!(
                 "{}{}\n{}\navailable: {}",
-                proxy.source().map_err(|e| e.to_string())?,
+                proxy.source().map_err(method_error)?,
                 if following {
                     " (following the system default)"
                 } else {
                     ""
                 },
-                proxy.source_description().map_err(|e| e.to_string())?,
-                proxy.source_available().map_err(|e| e.to_string())?
+                proxy.source_description().map_err(method_error)?,
+                proxy.source_available().map_err(method_error)?
             );
         }
         Some("list") => {
-            let following = proxy.source_following().map_err(|e| e.to_string())?;
+            let following = proxy.source_following().map_err(method_error)?;
             println!(
                 "{}\tfollow the system default{}",
                 crate::proto::SOURCE_DEFAULT,
                 if following { " (selected)" } else { "" }
             );
-            for device in proxy.devices().map_err(|error| error.to_string())? {
+            for device in proxy.devices().map_err(method_error)? {
                 println!(
                     "{}{}\t{}\tbus={} form={} virtual={}",
                     device.name,
@@ -346,7 +361,7 @@ fn source_inner(proxy: &ControlProxyBlocking<'_>, argument: Option<&str>) -> Res
             }
         }
         Some(name) => {
-            proxy.set_source(name).map_err(|error| error.to_string())?;
+            proxy.set_source(name).map_err(method_error)?;
             println!("source: {name}");
         }
     }
@@ -377,14 +392,14 @@ fn setting_inner(proxy: &ControlProxyBlocking<'_>, command: &str, on: bool) -> R
         "notify" => proxy.set_notify(on),
         _ => return Err(format!("unknown setting {command:?}")),
     }
-    .map_err(|error| error.to_string())?;
+    .map_err(method_error)?;
     println!("{command}: {}", if on { "on" } else { "off" });
     Ok(())
 }
 
 pub fn dismiss_notices() -> Result<(), String> {
     with_proxy(|proxy| {
-        proxy.dismiss_notices().map_err(|error| error.to_string())?;
+        proxy.dismiss_notices().map_err(method_error)?;
         println!("notices cleared");
         Ok(())
     })
@@ -392,7 +407,7 @@ pub fn dismiss_notices() -> Result<(), String> {
 
 pub fn clear_failure() -> Result<(), String> {
     with_proxy(|proxy| {
-        proxy.clear_failure().map_err(|error| error.to_string())?;
+        proxy.clear_failure().map_err(method_error)?;
         println!("last failure cleared");
         Ok(())
     })
@@ -405,5 +420,93 @@ pub fn service_start() -> Result<(), String> {
         crate::proto::UNIT,
         service::is_active()
     );
+    Ok(())
+}
+
+/// Print where the model is, and whether it is there.
+///
+/// `models` is the caller's `--models DIR`; without it the search is
+/// `DFMIC_MODELS` then the data directory, the same rule the daemon uses.
+pub fn models(explicit: Option<&std::path::Path>) -> Result<(), String> {
+    match explicit {
+        Some(dir) => println!("models directory: {}", dir.display()),
+        None => println!("data directory: {}", crate::models::data_dir().display()),
+    }
+    match crate::models::resolve(explicit) {
+        Ok(dir) => {
+            println!("model: present");
+            println!("using: {}", dir.display());
+            Ok(())
+        }
+        Err(_) => {
+            println!("model: not installed");
+            if crate::models::downloadable() {
+                println!("run `dfmic models download` to fetch it (about 20 MB)");
+            } else {
+                println!("this build has no download URL; pass --models DIR or set DFMIC_MODELS");
+            }
+            Err("the model is not installed".into())
+        }
+    }
+}
+
+/// Fetch the model into the data directory.
+///
+/// Through the daemon when one is running, so the download happens in the
+/// process that owns the data directory and the window can watch it; directly
+/// otherwise, which is the case before the service has ever been started.
+///
+/// `models` is the caller's `--models DIR`. It decides where a direct download
+/// lands; when a daemon is running it is the daemon's own path that matters, and
+/// the daemon reports where the files went, so nothing here has to guess.
+pub fn models_download(models: Option<&std::path::Path>) -> Result<(), String> {
+    // Whether a daemon answers decides which path to take, and that has to be
+    // established before the download is requested: falling back to a direct
+    // download after the daemon has *refused* would quietly write the model
+    // somewhere the daemon may not read, and hide the reason it gave.
+    let live = with_proxy(|proxy| proxy.model_present().map(|_| ()).map_err(method_error)).is_ok();
+    if live {
+        with_proxy(|proxy| proxy.download_model().map_err(method_error))?;
+        // Two bounds, because the two ways this can stall are different: the
+        // daemon never starts, or the transfer itself hangs. Once it has started,
+        // `curl`'s own `--max-time` is the limit, with slack over it so a slow
+        // link is not reported as a failure by this loop first.
+        let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let transfer_limit = std::time::Duration::from_secs(20 * 60);
+        let mut started = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let (downloading, present) = with_proxy(|proxy| {
+                Ok((
+                    proxy.model_downloading().map_err(method_error)?,
+                    proxy.model_present().map_err(method_error)?,
+                ))
+            })?;
+            if present {
+                // The daemon knows where it wrote the files; it says so through
+                // the Source of truth every other client reads.
+                let dir = with_proxy(|proxy| proxy.model_path().map_err(method_error))?;
+                println!("model ready in {dir}");
+                return Ok(());
+            }
+            if downloading {
+                let start = *started.get_or_insert_with(std::time::Instant::now);
+                if start.elapsed() >= transfer_limit {
+                    return Err(format!(
+                        "the download did not finish within {} minutes",
+                        transfer_limit.as_secs() / 60
+                    ));
+                }
+            } else if started.is_some() {
+                // It ran and finished without producing a model: the daemon
+                // has already told the user why, through a notification.
+                return Err("the download finished without installing the model".into());
+            } else if std::time::Instant::now() >= start_deadline {
+                return Err("the daemon did not start the download".into());
+            }
+        }
+    }
+    let dir = crate::models::download_default(models)?;
+    println!("model ready in {}", dir.display());
     Ok(())
 }

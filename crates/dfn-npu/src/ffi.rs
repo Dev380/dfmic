@@ -39,7 +39,8 @@ pub struct ov_available_devices {
     pub size: usize,
 }
 
-/// `ov_element_type_e`, only the variants we use.
+/// `ov_element_type_e`, only the variants we use. C enums are `int`-wide, which
+/// is why the element type travels as an `i32` in the signatures below.
 pub const OV_ELEMENT_TYPE_F32: i32 = 4;
 
 pub type ov_status = i32;
@@ -68,7 +69,6 @@ extern "C" {
         devices: *mut ov_available_devices,
     ) -> ov_status;
     pub fn ov_available_devices_free(devices: *mut ov_available_devices);
-    pub fn ov_core_get_version() -> *const c_char;
 
     pub fn ov_compiled_model_free(compiled_model: *mut ov_compiled_model_t);
     pub fn ov_compiled_model_create_infer_request(
@@ -126,10 +126,17 @@ extern "C" {
     ) -> ov_status;
     pub fn ov_tensor_data(tensor: *const ov_tensor_t, data: *mut *mut c_void) -> ov_status;
     pub fn ov_tensor_get_size(tensor: *const ov_tensor_t, size: *mut usize) -> ov_status;
+    /// `size` counts elements; `ov_tensor_get_byte_size` is the one that bounds
+    /// a reinterpretation of the buffer.
+    pub fn ov_tensor_get_byte_size(tensor: *const ov_tensor_t, size: *mut usize) -> ov_status;
+    pub fn ov_tensor_get_element_type(
+        tensor: *const ov_tensor_t,
+        element_type: *mut i32,
+    ) -> ov_status;
     pub fn ov_tensor_free(tensor: *mut ov_tensor_t);
 
     pub fn ov_shape_create(rank: i64, dims: *const i64, shape: *mut ov_shape) -> ov_status;
-    pub fn ov_shape_free(shape: *mut ov_shape);
+    pub fn ov_shape_free(shape: *mut ov_shape) -> ov_status;
 }
 
 /// An OpenVINO error, including the status code so callers can report it.

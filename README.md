@@ -1,4 +1,9 @@
-# dfmic
+# dfmic: DeepFilterNet low-latency noise suppression on Intel NPUs
+
+Note: The following is an AI vibeslopped README that I don't really have time to fix right now sorry :( but it is working!
+
+---
+
 
 DeepFilterNet3_**ll** noise suppression as a virtual microphone, running on the
 **Intel NPU** (Intel AI Boost) rather than the CPU.
@@ -35,8 +40,14 @@ graphs are stateful in **two** ways:
 The runtime therefore carries two kinds of state per graph: a window of past
 input frames (for the convs) and a per-frame history of each GRU's outputs.
 
+The two numbers in this document that are easy to confuse: **0.96–1.13 ms** is
+what the **Python** runtime drives through the converted graphs (measured
+offline, not on the daemon's path), while `dfmic doctor` reports the **Rust**
+pipeline end to end and reads 2.2–2.6 ms per frame on this machine (see
+[Status](#status-stage-3-complete-gui)).
+
 Measured cost of that choice, driving the real graphs on the NPU, 48 kHz mono,
-480-sample hop:
+480-sample hop, through the Python runtime:
 
 | metric | value |
 |---|---|
@@ -54,20 +65,37 @@ of a core. The NPU is not faster — it is *freeing*, which is the point.
 
 `tools/dfnpy/verify_convert.py` runs the original stateless ONNX graphs over a
 whole sequence (OpenVINO CPU, f32) and compares them against the converted IR
-driven frame by frame. Current result on the NPU:
+driven frame by frame. Both sides of that comparison are **CPU**: the reference
+is fp32 CPU, so the candidate has to be the same kind of device and the same
+precision, and the check has to run on machines with no NPU. The flake runs it
+with `--device CPU` for exactly that reason.
+
+Current result (default seed, 60 frames, `--settle 10`, as measured on
+2026-11-26):
 
 ```
-emb    SDR 48.66 dB      c0    SDR 69.35 dB
-e0     SDR 67.29 dB      e3    SDR 63.45 dB
-m      SDR 44.97 dB      coefs SDR 39.64 dB
+emb    SDR 48.98 dB      c0    SDR 76.34 dB
+lsnr   SDR 37.76 dB      e0    SDR 71.74 dB
+e3     SDR 66.79 dB      m     SDR 44.98 dB
+coefs  SDR 40.14 dB
 ```
 
-With an f32 IR the convolution heads are *bit-exact* (`inf dB`); the residual on
-the GRU path is chaotic amplification of float reordering on the random noise
-used as test input. Real speech does not do that, which is what the next gate
-(`--settle`, real audio vs upstream `deep-filter`) is for.
+The bound is per output, not global: the convolution heads (`e0`, `e3`, `c0`)
+never consume a GRU output and are deterministic to within a dB across seeds, so
+their floor is 60 dB; the GRU-carried heads (`emb`, `lsnr`, `m`, `coefs`) amplify
+float reordering chaotically on random-noise input (22–60 dB across 60 seeds) and
+only get a 25 dB "did not collapse" floor.
 
-This check is wired up as `nix build .#checks.x86_64-linux.parity`.
+The IR is built with `compress_to_fp16`, so even the convolution heads are not
+bit-exact against the fp32 reference: `e0` reads ~71.7 dB, not `inf dB`. Build
+with `--fp32` and those three read `inf dB`, which confirms the difference is the
+built precision and not the graph rewrite. The GRU path's residual is chaotic
+amplification of float reordering on the random noise used as test input; real
+speech does not do that, which is what the next gate (`--settle`, real audio vs
+upstream `deep-filter`) is for.
+
+This check is wired up as `nix build .#checks.x86_64-linux.parity`, and
+`nix flake check` builds it along with the package and its tests.
 
 ## Usage
 
@@ -79,10 +107,13 @@ nix build .#models     # converted IR in ./result (manifest.json + config.ini)
 python tools/dfnpy/convert.py \
   --model-tar DeepFilterNet3_ll_onnx.tar.gz --out /tmp/ir
 
-# prove the conversion is faithful
+# prove the conversion is faithful (CPU: the reference is fp32 CPU)
 python tools/dfnpy/verify_convert.py \
   --model-tar DeepFilterNet3_ll_onnx.tar.gz --ir /tmp/ir \
-  --device NPU --frames 60 --settle 10
+  --device CPU --frames 60 --settle 10
+
+# check the GRU decomposition on its own
+python tools/dfnpy/check_gru.py --model-tar DeepFilterNet3_ll_onnx.tar.gz
 ```
 
 `manifest.json` in the IR directory describes, per graph, the static input
@@ -94,39 +125,28 @@ shapes, the window length and each state tensor (name, shape, output index).
   compile, the daemon will fail loudly and leave the real microphone as the
   default. No CPU inference path exists.
 - **10 ms blocks.** The `_ll` model's own latency is ~10 ms (`hop_size` 480,
-  `df_lookahead` 0); the windowed inference keeps that, at 11% NPU duty.
+  `df_lookahead` 0); the windowed inference keeps that. On the Rust pipeline the
+  NPU duty is the 2.2–3.0 ms `doctor` figure against a 10 ms hop, i.e. 22–30%
+  (see [Status](#status-stage-3-complete-gui)); the 11% in the Python timing
+  table above is that runtime, not the daemon.
 - **The system audio graph is only touched on request.** A small PipeWire
   quantum makes every application's graph shorter, so it is a user setting
   (`graph-quantum`, on by default) that is requested *only while filtering* and
   handed back the moment the filter stops. Status reports measured capture,
   buffering, model and output latency separately, and sums them, instead of
   treating the 10 ms model delay as the whole cost.
-- **The audio bridge is Rust.** The virtual microphone uses the official
-  `pipewire-rs` bindings, so the realtime process callbacks are ordinary Rust
-  rather than careful C. `pw_bridge.c` is gone; the only hand-written FFI left
-  is OpenVINO's.
-- **The NPU runs on its own thread, and that is load-bearing.** Processing
-  inline in PipeWire's realtime callback would be lower latency, but the worker
-  has a long tail: over 4000 hops of real audio the p99.9 was 8.3 ms and the
-  worst single hop 50 ms. Inline, a 50 ms stall breaks the graph and glitches
-  every client. Decoupling through the rings turns that into a dropped buffer at
-  worst. (The same measurement with `CAP_SYS_NICE` gives 6.8 ms and 20 ms, which
-  is why `services.dfmic.realtime` exists — it buys margin, not latency.)
-- **Where the ~26 ms goes.** Measured end to end with a consumer attached:
-  ~3 ms of capture-stream buffering, ~10 ms of queue, 10 ms of model
-  look-ahead and ~3 ms of output-stream buffering. Inference (~5.8 ms) is *not*
-  added to that: it is absorbed by the queue that plays while the NPU works.
-  The 10 ms look-ahead was verified empirically, by pushing a signal through
-  `enhance` and cross-correlating: the output lags the input by exactly 480
-  samples.
-- **It costs ~6% of one core, and that is real work.** Measured on a release
-  build while filtering: 8% of a core for the process, 6% of that in the NPU
-  worker. A `perf` profile of the worker shows it is not OpenVINO overhead but
-  the DSP itself: rustfft's butterflies (the STFT and ISTFT), the deep-filter
-  synthesis, AGC, and the `memmove`s that marshal tensors in and out of
-  OpenVINO. Idle or passing audio through costs 0%. Note the release build
-  matters: the same code costs 13-15% in a debug build, which is what `perf`
-  will show you if you profile `cargo run` without `--release`.
+- **It costs a few percent of one core, and that is real work.** The numbers in
+  this file predate the current pipeline and could not be reproduced for this
+  revision, so treat them as an indication rather than a measurement: 8% of a
+  core for the process while filtering, 6% of that in the NPU worker, 0% idle or
+  passing audio through. What can be reproduced is the offline cost, which uses
+  the same DSP: `dfmic enhance` on 60 s of audio ran 11.4-11.8 s, i.e. **5.2-5.3x
+  realtime** on 2026-11-26. A `perf` profile of the worker shows it is not
+  OpenVINO overhead but the DSP itself: rustfft's butterflies (the STFT and
+  ISTFT), the deep-filter synthesis, AGC, and the `memmove`s that marshal tensors
+  in and out of OpenVINO. The release build matters: a debug build is several
+  times more expensive, which is what `perf` will show you if you profile
+  `cargo run` without `--release`.
 - **The queue depth adapts, the way libDF's does.** libDF keeps a `proc_delay`
   that grows a frame when the worker falls behind and shrinks when it has
   headroom, floored at `frame_size * (1 + min_buffer)`. Ours does the same, with
@@ -157,18 +177,26 @@ shapes, the window length and each state tensor (name, shape, output index).
   every client. Decoupling through the rings turns that into a dropped buffer at
   worst. (The same measurement with `CAP_SYS_NICE` gives 6.8 ms and 20 ms, which
   is why `services.dfmic.realtime` exists — it buys margin, not latency.)
-- **Where the ~41 ms goes.** Measured end to end with a consumer attached:
-  6 ms of capture-stream buffering, 20 ms of queue, 10 ms of model look-ahead
-  and 5 ms of output-stream buffering. Inference (~5.8 ms) is *not* added to
-  that: it is absorbed by the queue that plays while the NPU works. The queue is
-  pinned at two hops by libDF's shortening rule, which is the floor — one hop
-  drops buffers, and so does one hop plus a quantum. `doctor` reports the cost
-  with the SNR gates opened, because the DSP skips the ERB gains and the deep
-  filter both on clean input and on plain noise, which used to make its figure
-  about three times too optimistic.
+- **Where the ~40 ms goes.** As measured on the development machine on
+  2026-11-26 with a consumer attached, `dfmic status` reports the parts
+  separately and sums them: ~6 ms of capture-stream buffering, 20 ms of queue,
+  10 ms of model look-ahead and ~5 ms of output-stream buffering. The parts are
+  measured from `pw_stream_get_time_n` and the ring lengths, not estimated. Two
+  of them follow from code, so they are not machine-specific: the look-ahead is
+  `HOP_SIZE / RATE` = 10 ms (`MODEL_DELAY_MS`), and the queue floor is
+  `MIN_HOPS = 2` hops = 20 ms. The stream-buffering figures move with the
+  quantum and the device. Inference is deliberately *not* added: it is absorbed
+  by the queue that plays while the NPU works, so counting it would count the
+  same milliseconds twice. `doctor` reports the per-frame cost with the SNR
+  gates opened, because the DSP skips the ERB gains and the deep filter both on
+  clean input and on plain noise, which used to make its figure about three
+  times too optimistic.
 - **Stateful artifacts are built, never generated at runtime.** The Nix
-  derivation produces the IR; the daemon will load it and cache an
-  `EXPORT_IMPORT`-compiled NPU blob so restarts skip the compile.
+  derivation produces the IR; nothing at runtime touches ONNX. The daemon does
+  **not** cache a compiled NPU blob today: `NpuRuntime::load` takes a
+  `cache_dir`, but every caller passes `None`, so each start pays the NPU
+  compile (0.1–0.2 s here, reported by `doctor`). The plumbing for
+  `CACHE_DIR` + `CACHE_MODE=OPTIMIZE_SPEED` is in `dfn-npu` and unused.
 - **Vendored DSP.** Stage 2 vendors `DFState` from `libDF` (MIT/Apache-2.0,
   credited) rather than forking the whole training repo.
 
@@ -197,18 +225,24 @@ it captures and of the samples it hands to the source node, and the GUI maps
 those to a −60..0 dBFS scale.
 
 The window only repaints when a value actually changed, so a panel with no audio
-flowing costs nothing at all. With meters moving it renders at a steady 30 fps,
-which on this machine measures 0.3–0.5 ms of CPU per frame: about 1–2% of one
-core for the whole window. (A debug build is five to six times worse, which is
-worth knowing before blaming the UI.)
+flowing costs almost nothing: measured with meters live and a consumer attached
+(2026-11-26, release build, femtovg on the GPU), the window process used
+0.9-1.1 s of CPU per 10 s, i.e. **9-11% of one core** at a steady 26-27 fps, or
+roughly 3.5-4 ms of CPU per frame. Hidden or idle it drops to ~1 fps and ~1% of a
+core. (A debug build is several times worse, which is worth knowing before
+blaming the UI.)
 
 What each frame costs is up to the renderer. Slint's default is OpenGL
-(femtovg), which repaints the entire window every frame; that is cheap on a GPU
-and expensive through a CPU-side OpenGL implementation, where Slint's software
-renderer is 3.5x faster because it tracks dirty regions instead. So the window
-asks for the software renderer when OpenGL would be software (`LIBGL_ALWAYS_SOFTWARE`,
-a `MESA_LOADER_DRIVER_OVERRIDE` naming llvmpipe, or no `/dev/dri` render node at
-all) and uses the GPU otherwise. `SLINT_BACKEND` overrides the choice:
+(femtovg), which repaints the entire window every frame *regardless of how much
+changed* - the cost is in scene traversal, glyph runs and path tessellation, not
+in the rasterised area. That is why hiding part of the window does not make
+frames cheaper under femtovg, and why Slint's software renderer, which does track
+dirty regions, is the cheaper choice when OpenGL itself would be software. The
+same 8 s measurement with `SLINT_BACKEND` forced: software 1.6 s of CPU, femtovg
+1.2 s, on this machine's GPU. So the window asks for the software renderer when
+OpenGL would be software (`LIBGL_ALWAYS_SOFTWARE`, a `MESA_LOADER_DRIVER_OVERRIDE`
+naming llvmpipe, or no `/dev/dri` render node at all) and uses the GPU otherwise.
+`SLINT_BACKEND` overrides the choice:
 
 ```
 SLINT_BACKEND=winit-software dfmic gui     # never touch OpenGL
@@ -259,8 +293,8 @@ virtual microphone for it to work.
 
 1. **Model + parity (done, except real-audio gate)** — remaining: a numpy port
    of libDF's `DFState` (STFT/ERB/normalisation/deep-filter/synthesis) so the
-   harness can run real speech against upstream `deep-filter`, plus the offline
-   `dfmic enhance in.wav -o out.wav` CLI.
+   harness can run real speech against upstream `deep-filter`. The offline CLI
+   already exists: `dfmic enhance in.wav out.wav` (positional output, no `-o`).
 2. **Engine + PipeWire** — Rust, vendored DSP, OpenVINO behind a runtime trait,
    exported `Audio/Source` node, systemd user service, default-source takeover
    with restore, loud failure handling.
@@ -275,20 +309,31 @@ Schröter et al., MIT/Apache-2.0 — see `NOTICE`.
 ## Status: stage 3 complete (GUI)
 
 The daemon, the PipeWire node and the systemd integration work. Verified on this
-machine (Core Ultra 9 285H, Intel AI Boost NPU, PipeWire 1.6.11 + WirePlumber):
+machine (Core Ultra 9 285H, Intel AI Boost NPU, PipeWire 1.6.11 + WirePlumber) on
+2026-11-26:
 
 ```
-dfmic doctor
-  openvino devices: ["CPU", "GPU", "NPU"]
-  compiled on NPU in 0.07 s
-  steady state: 1.9 ms per 10 ms frame (5.2x realtime, 10% duty)
-
-dfmic run
-  dfmic: capturing from alsa_input...HiFi__Mic1__source
-  dfmic: 'DeepFilter Mic' is now the default source
-  ... recordings from dfmic-source: rms 0.0038, peak 0.025, 0 dropped frames
-  ... on exit: restored default source to alsa_input...HiFi__Mic1__source
+$ dfmic doctor
+openvino devices: ["CPU", "GPU", "NPU"]
+models: ~/.local/share/dfmic/models/DeepFilterNet3_ll-0.5.6
+compiled on NPU in 0.11 s
+steady state: 2.96 ms per 10 ms frame (3.4x realtime, 29.6% duty)
 ```
+
+That figure is the whole Rust pipeline (DSP + all three graphs on the NPU) per
+10 ms hop, and it is noisy: five 500-frame runs on the same machine gave
+2.2–2.6 ms, and `DFMIC_DOCTOR_PACED=1` (pacer on, like the daemon) gave 5.1 ms
+because the sleeps and the NPU contend. Quote it as "a few ms", not as a
+headline. With 10 ms of hop that is 3–5× realtime, so 20–35% NPU duty.
+
+The daemon prints very little: it reports a model load or a missing model, a
+failed `pw-metadata` restore and a `CAP_SYS_NICE` note (if realtime priority was
+not granted), and otherwise works through the bus. Operators watch it with
+`dfmic status`, `journalctl --user -u dfmic` and the window, not with its stdout.
+The startup path worth knowing is the unpleasant one: after an unclean stop it
+reads `$XDG_STATE_HOME/dfmic/default-source`, restores the default source *before*
+creating any stream, and reports `could not restore PipeWire default source ...`
+if it cannot — which needs `pw-metadata` on `PATH` (see [NixOS](#nixos)).
 
 What the daemon does:
 
@@ -300,7 +345,8 @@ What the daemon does:
 - takes over the default source while running and restores it on exit, including
   after `SIGKILL` (the previous default is written to
   `$XDG_STATE_HOME/dfmic/default-source` and restored on the next start),
-- writes `$XDG_RUNTIME_DIR/dfmic/status` with live counters for `dfmic status`,
+- writes no status file: `dfmic status` reads `org.dfmic.Control` over the
+  session bus, and works only while the daemon owns the name,
 - and **idles the NPU when nothing is recording** from the node: on a laptop that
   is the difference between filtering into the void and actually saving power.
 
@@ -320,8 +366,10 @@ Both were found by testing against the real system rather than in isolation:
 
 The DSP is exact: replaying libDF's own gains/coefficients through `dfn-dsp`
 (`dfmic replay-dsp`) reproduces upstream's audio at **51 dB SDR**, and the
-converted graphs match the upstream ONNX graphs to ~1e-3 when given the same
-recurrent state.
+converted graphs match the upstream ONNX graphs to ~1e-3 per element when given
+the same recurrent state (the `max|diff|` column of `verify_convert.py`; the
+GRU-carried heads are 1e-2 to 1, because random noise makes the recurrence
+chaotic).
 
 End-to-end, however, our output is *not* sample-identical to upstream
 `deep-filter`. The reason is the recurrent state: upstream (tract's `pulse`)
@@ -331,8 +379,10 @@ DFN3's encoder GRU has long enough memory that the difference never fully decays
 
 Measured consequence: on speech-like audio with a known clean reference, upstream
 and dfmic behave the same (output rms 0.0139 vs 0.0142, same suppression), but the
-waveforms differ. Making it sample-exact would mean exposing per-layer conv state
-in the IR, which is a larger change than it is worth for a live microphone.
+waveforms differ. That comparison was made through `enhance`, on a fixed input,
+before the AGC existed; the daemon's AGC adds a second, deliberate difference.
+Making it sample-exact would mean exposing per-layer conv state in the IR, which
+is a larger change than it is worth for a live microphone.
 
 ## Usage
 
@@ -341,7 +391,9 @@ in the IR, which is a larger change than it is worth for a live microphone.
 dfmic doctor
 
 # clean a file offline
-dfmic enhance in.wav out.wav [--atten-lim 100] [--post-filter 0.02]
+# --agc runs the automatic gain exactly as the daemon does, so the gain path can
+# be measured on a fixed recording; --agc-trace prints one line per hop
+dfmic enhance in.wav out.wav [--atten-lim 100] [--post-filter 0.02] [--agc [--agc-trace]]
 
 # the virtual microphone (becomes the default source, restores on exit)
 dfmic run [--source <node name>] [--default-source never]
@@ -404,9 +456,28 @@ systemctl --user start dfmic.service
 dfmic autostart on
 ```
 
-The unit restarts on failure with a backoff. `dfmic service start`, `Autostart`
-and `SetAutostart` operate without depending on daemon-owned state. The module
-is not a home-manager module and does not use `home.packages`.
+The module overrides the unit's `PATH` (both its drop-in and the one the package
+ships) to include what the daemon actually launches: `pw-metadata`
+(`pkgs.pipewire`), `curl`, `sha256sum` (`pkgs.coreutils`), `tar` + `gzip`
+(`pkgs.gnutar`, `pkgs.gzip`) and `systemctl` (`pkgs.systemd`). NixOS user units
+get only its minimal default `PATH` otherwise, which holds none of these —
+without `pw-metadata` the daemon cannot restore the default source after an
+unclean stop and refuses to start, and `Restart=on-failure` then loops. `tar -xzf`
+shells out to `gzip`, so it is listed explicitly rather than assumed.
+
+`services.dfmic.source` is a node **name**, and names can contain spaces. The
+module passes the whole argv through `utils.escapeSystemdExecArgs`, so
+`source = "Built-in Audio Analog Stereo"` arrives as one argument instead of a
+target plus four stray parameters.
+
+Set `services.dfmic.realtime = false` if you do not want the `CAP_SYS_NICE`
+wrapper; everything else is unaffected.
+
+The unit restarts on failure with a fixed `RestartSec=5`, throttled to five starts
+per minute: without a start limit, a start-up that always fails would repeat
+every five seconds forever. `dfmic service start`, `Autostart` and `SetAutostart`
+operate without depending on daemon-owned state. The module is not a
+home-manager module and does not use `home.packages`.
 
 ### Realtime priority while developing
 
@@ -442,14 +513,64 @@ multiple clients can poll it without stealing each other's peaks.
   Source changes reconnect only the capture stream. The previous real default
   is restored on graceful exit and from an atomic backup on the next start
   after an unclean exit.
-* AGC is voice-gated by the model's local SNR plus an input floor, holds between
-  phrases, is bounded to +18 dB and feeds a -1 dBFS limiter. Self-monitor
+* AGC levels the signal the suppressor **produced**, not the microphone signal,
+  to -18 dBFS RMS: it cuts in 0.2 s and boosts over 1 s, bounded to +18 dB into
+  a -1 dBFS limiter, and additionally capped so the amplified room never exceeds
+  -30 dBFS however the gate behaves. Its gate is a level test against a room
+  floor tracked as the minimum of the smoothed input over 10 s, plus 12 dB, with
+  the model's own zero-mask threshold as a veto — the local SNR alone is not a
+  voice detector (measured over a quiet room: median -9 dB, above zero in a
+  third of hops). The gain holds across the gaps inside a sentence and releases
+  to unity at 4 dB/s after them, so a quiet room comes out quieter than the
+  microphone instead of 12 dB above it. `dfmic enhance --agc` runs the same path
+  on a file. Self-monitor
   follows the default sink and also counts as a processing consumer. It is off
   by default; a saved monitor request starts only for a headphone target.
+* The window stops working when there is nothing to look at. Hidden or minimised,
+  the meter tick drops to 4 Hz and the microphone capture stops; scrolled so the
+  Levels card is out of the viewport, the meters stop updating and the daemon is
+  no longer polled for levels at all (`Levels()` only feeds the output meter,
+  which means nothing unless something is being sent). Measured 111 → 16 ms/s.
+  Occlusion is left to Slint's renderer, which skips the draw. Its `pw-record`
+  children carry `PR_SET_PDEATHSIG`, so a killed window cannot leave an orphan
+  holding the microphone.
+* The input meter works without the daemon: with no device list to consult, the
+  window captures the **system default source** (no `--target`), so the mic bar
+  still moves when the service is down.
+* The daemon meters nothing on its input: the **window** captures the physical
+  microphone itself for the input meter, so an idle daemon pauses its capture
+  stream entirely (measured: 0 ms/s of CPU and **0 wakeups/s** when off). The
+  event loop does not poll at all: every asynchronous source of change rings a
+  wake channel — D-Bus commands, PipeWire's registry and metadata callbacks, the
+  worker, a finished download and the signal handler — so it sleeps until there
+  is something to do, with a 30 s timeout purely as a safety net. The one
+  exception is a missing model, which is polled at 2 Hz because a file appearing
+  on disk cannot announce itself.
+* The daemon **always starts with the filter off**, and does not take the system
+  default until it is turned on. Whether it is on is runtime state, not a
+  setting: nothing is written to `settings.toml` for it, so a saved `enabled`
+  from an older version is ignored and a login can never grab the microphone
+  unattended.
 * `source = "default"` in the settings file means follow the system default. The
   daemon re-resolves it on every registry change and retargets only the capture
   stream, so switching microphones costs no restart and no re-negotiation of the
   exported node.
+* Where the model comes from depends on how dfmic was installed. The **Nix
+  package** builds the IR as its own derivation (`nix/models.nix`), links it at
+  `$out/share/dfmic/models` and points the unit's `DFMIC_MODELS` there — so it
+  *is* in the closure, and an installed daemon never downloads anything (the
+  target is read-only, so `can_download` is false and the window offers no
+  button). A **from-source build** has neither, so it searches
+  `$XDG_DATA_HOME/dfmic/models/<version>/` and can fetch the `.tar.gz` release
+  asset **on request**, never behind your back (SHA-256 checked before anything
+  is unpacked). Missing model is a state (`no-model`), not a failure: the daemon
+  runs, owns the bus, lists devices and passes audio through untouched. The
+  **daemon** is the only thing that downloads — the window asks it over
+  `DownloadModel()`, and `dfmic models download` uses the same call when a daemon
+  is running (and downloads directly when one is not). `ModelPresent`,
+  `ModelDownloading` and `ModelDownloadPossible` report it, so a client can offer
+  the button only when it could work. `--models DIR` and `DFMIC_MODELS` win over
+  both, which is how the dev shell supplies it.
 * Comparison takes are written to `$XDG_DATA_HOME/dfmic/compare/` as
   `raw.wav` and `filtered.wav`. `StartRecording(seconds)` returns at once,
   `StopRecording()` ends a take early keeping what it has, and `Recording`
@@ -471,14 +592,19 @@ multiple clients can poll it without stealing each other's peaks.
 ## Development
 
 ```sh
-nix develop
+nix develop                # exports DFMIC_MODELS, RUSTFLAGS and LD_LIBRARY_PATH
 cargo build                # daemon and CLI, no GUI feature required
-cargo test                 # DSP unit tests (STFT round trip, ERB bank, ...)
+cargo test                 # DSP, AGC, replay and GUI-logic tests (17 today)
 cargo clippy -p dfmic --no-deps -- -D warnings
-nix build .#dfmic          # the daemon
+nix build .#dfmic          # the daemon; its tests run in the build (doCheck)
 nix build .#models         # converted NPU artifacts
-nix flake check            # conversion parity gate
+nix flake check            # package + its tests, and the parity gate
 ```
+
+The dev shell exports `DFMIC_MODELS` pointing at the built model derivation, so
+both `cargo run` and `tools/dfmic-rt` find the IR without a download. `cargo
+build`/`cargo test` there still need the shell's `RUSTFLAGS` and
+`LD_LIBRARY_PATH` for `pipewire-sys` and the GUI.
 
 Diagnostics that paid for themselves:
 
@@ -486,4 +612,7 @@ Diagnostics that paid for themselves:
   per-frame outputs, for comparison against `libDF/examples/dump_features.rs`.
 - `DFMIC_DUMP=1 dfmic enhance ...` — per-frame gains/coefficients in the same
   format as libDF's `DF_DUMP`, feedable to `dfmic replay-dsp`.
+- `dfmic enhance --agc --agc-trace ...` — per-hop input level, the
+  post-suppression level the gain was computed from, the gain, and whether the
+  gate was open.
 - `DFMIC_DEBUG=1 dfmic run` — PipeWire stream state transitions.

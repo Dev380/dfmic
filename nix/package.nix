@@ -11,11 +11,22 @@
   libxkbcommon,
   fontconfig,
   freetype,
+  curl,
+  coreutils,
+  gnutar,
+  gzip,
+  systemd,
   withGui ? true,
 }:
 # The daemon. The model IR is a separate derivation so the (slow) conversion is
 # cached independently of the code.
-rustPlatform.buildRustPackage {
+rustPlatform.buildRustPackage (let
+  # Everything the daemon forks: `pw-metadata` (default-source takeover and its
+  # startup recovery), curl + sha256sum + tar + gzip (the model downloader) and
+  # `systemctl` (unit queries from the GUI). NixOS user units get its minimal
+  # default PATH otherwise, which holds none of these.
+  servicePath = lib.makeBinPath [pipewire curl coreutils gnutar gzip systemd];
+in {
   pname = "dfmic";
   version = "0.1.0";
 
@@ -59,15 +70,16 @@ rustPlatform.buildRustPackage {
       [Unit]
       Description=DeepFilterNet3_ll virtual microphone on the Intel NPU
       After=pipewire.service wireplumber.service
+      Wants=wireplumber.service
       Requires=pipewire.service
       PartOf=pipewire.service
 
       [Service]
-      ExecStart=/run/current-system/sw/bin/dfmic run
+      ExecStart=$out/bin/dfmic run
       Environment=DFMIC_MODELS=$out/share/dfmic/models
+      Environment=PATH=${servicePath}
       Restart=on-failure
       RestartSec=5
-      Nice=-10
 
       [Install]
       WantedBy=default.target
@@ -75,17 +87,24 @@ rustPlatform.buildRustPackage {
     ''
     + lib.optionalString withGui ''
       install -Dm644 ${./dfmic.desktop} $out/share/applications/dfmic.desktop
-      for size in 128 256; do
-        install -Dm644 ${./icon.png} $out/share/icons/hicolor/''${size}x''${size}/apps/dfmic.png
-      done
+      # The source PNG is 256x256. Installing it at 128x128 too would declare a
+      # size it is not, so desktop shells would scale it anyway.
+      install -Dm644 ${./icon.png} $out/share/icons/hicolor/256x256/apps/dfmic.png
     '';
 
-  doCheck = false; # the DSP tests run in `nix flake check`, which has the models
+  # The tests are pure Rust and need no model files, so they run here. The test
+  # flags do not inherit `cargoBuildFlags`, so the GUI feature has to be named
+  # again: without it the four GUI-logic tests are not compiled, and this build
+  # would not check the code it just produced.
+  doCheck = true;
+  cargoTestFlags = lib.optionals withGui ["--features" "gui"];
 
   meta = {
     description = "DeepFilterNet3_ll noise suppression as a PipeWire virtual microphone on the Intel NPU";
-    license = lib.licenses.mit;
+    # Same as the crates' own `license` field (MIT OR Apache-2.0); the dev shell,
+    # the daemon and the model IR are all dual-licensed.
+    license = lib.licenses.OR [lib.licenses.mit lib.licenses.asl20];
     mainProgram = "dfmic";
     platforms = ["x86_64-linux"];
   };
-}
+})

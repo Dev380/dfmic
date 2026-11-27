@@ -9,6 +9,7 @@ use std::time::Instant;
 use dfn_dsp::{DfnPipeline, ModelRuntime, Params, HOP_SIZE};
 use dfn_npu::NpuRuntime;
 
+use crate::agc::{self, Agc};
 use crate::wav;
 
 pub struct Options {
@@ -17,6 +18,14 @@ pub struct Options {
     pub models: std::path::PathBuf,
     pub device: String,
     pub params: Params,
+    /// Run the AGC, exactly as the daemon does. This is the only way to measure
+    /// the gain path on a fixed piece of audio: the daemon's own path needs a
+    /// microphone, a consumer and a PipeWire graph, none of which is repeatable.
+    pub agc: bool,
+    /// Print one line per hop: `AGC <hop> <lsnr> <in_db> <measured_db> <gain_db>
+    /// <gated>`, where `measured_db` is the post-suppression level the gain was
+    /// computed from, before the gain was applied.
+    pub agc_trace: bool,
 }
 
 pub fn run(opts: &Options) -> Result<(), String> {
@@ -47,12 +56,48 @@ pub fn run(opts: &Options) -> Result<(), String> {
     let mut block = vec![0.0f32; HOP_SIZE];
     let started = Instant::now();
     let mut frames = 0u64;
+    let mut agc = opts.agc.then(Agc::new);
+    if opts.agc_trace && !opts.agc {
+        // The trace exists to show what the AGC did, and without `--agc` it does
+        // nothing. Silently printing nothing would look like an AGC that never
+        // reacted.
+        return Err("--agc-trace needs --agc: it prints the AGC's decisions".into());
+    }
+    let (mut gain_min, mut gain_max) = (f32::INFINITY, f32::NEG_INFINITY);
+    let mut gated = 0u64;
+    // Reused across hops rather than reallocated: this is the offline path, but
+    // it is also the parity harness, and an allocation per hop is noise in its
+    // timings.
+    let mut enhanced = vec![0.0f32; HOP_SIZE];
 
     for chunk in audio.samples.chunks(HOP_SIZE) {
         block.fill(0.);
         block[..chunk.len()].copy_from_slice(chunk);
-        let mut enhanced = vec![0.0f32; HOP_SIZE];
+        enhanced.fill(0.0);
         let lsnr = pipeline.process(&block, &mut enhanced);
+        if let Some(agc) = agc.as_mut() {
+            let input_rms = agc::rms(&block);
+            let input_db = agc::db(input_rms);
+            let measured_db = agc::db(agc::rms(&enhanced));
+            let (gain, voice) = agc.process(
+                &mut enhanced,
+                agc::Hop {
+                    lsnr,
+                    input_rms,
+                    min_db_thresh: opts.params.min_db_thresh,
+                },
+                true,
+            );
+            gain_min = gain_min.min(gain);
+            gain_max = gain_max.max(gain);
+            gated += u64::from(voice);
+            if opts.agc_trace {
+                println!(
+                    "AGC {frames} {lsnr:.2} {input_db:.2} {measured_db:.2} {gain:.2} {}",
+                    u8::from(voice)
+                );
+            }
+        }
         if trace {
             println!("{frames} {lsnr:.4}");
         }
@@ -67,6 +112,16 @@ pub fn run(opts: &Options) -> Result<(), String> {
         "dfmic: {frames} frames, {audio_secs:.2} s audio in {elapsed:.2} s ({:.1}x realtime)",
         audio_secs / elapsed
     );
+    if agc.is_some() {
+        let input_db = agc::db(agc::rms(&audio.samples));
+        let output_db = agc::db(agc::rms(&out));
+        eprintln!(
+            "dfmic: agc: in {input_db:.1} dBFS, out {output_db:.1} dBFS ({:+.1} dB), \
+             gain {gain_min:+.1}..{gain_max:+.1} dB, gate open {:.0}% of hops",
+            output_db - input_db,
+            100.0 * gated as f64 / frames.max(1) as f64,
+        );
+    }
 
     wav::write_f32(&opts.output, 48_000, &out)
 }
@@ -121,7 +176,11 @@ pub fn doctor(models: &Path, device: &str) -> Result<(), String> {
     let n: usize = std::env::var("DFMIC_DOCTOR_FRAMES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
+        .unwrap_or(100)
+        // A zero-frame run divides by zero below and reports NaN for everything.
+        .max(1);
+    let trace_hops = std::env::var_os("DFMIC_DOCTOR_HOPS").is_some();
+    let paced = std::env::var_os("DFMIC_DOCTOR_PACED").is_some();
     let mut spent = 0.0f64;
     for _ in 0..n {
         for sample in block.iter_mut() {
@@ -131,23 +190,27 @@ pub fn doctor(models: &Path, device: &str) -> Result<(), String> {
         pipeline.process(&block, &mut out);
         let hop = hop_started.elapsed().as_secs_f64();
         spent += hop;
-        if std::env::var("DFMIC_DOCTOR_HOPS").is_ok() {
+        // Read once, not per hop: `var` locks the environment and allocates, which
+        // is measurable against a 1 ms hop.
+        if trace_hops {
             eprintln!("HOP {:.3}", hop * 1000.0);
         }
         // Pace like the daemon: one hop every 10 ms.
-        if std::env::var("DFMIC_DOCTOR_PACED").is_ok() {
+        if paced {
             std::thread::sleep(
                 std::time::Duration::from_millis(10).saturating_sub(hop_started.elapsed()),
             );
         }
     }
     let per_frame = spent / n as f64;
+    let frame_seconds = HOP_SIZE as f64 / 48.0 / 1000.0;
     println!(
-        "steady state: {:.2} ms per {:.0} ms frame ({:.1}x realtime, {:.0}% duty)",
+        "steady state: {:.2} ms per {:.0} ms frame ({:.1}x realtime, {:.1}% duty)",
         per_frame * 1000.0,
-        HOP_SIZE as f64 / 48.0,
-        0.01 / per_frame,
-        per_frame * 100.0
+        frame_seconds * 1000.0,
+        frame_seconds / per_frame,
+        // Duty is processing time over the frame period, as a percentage.
+        per_frame / frame_seconds * 100.0
     );
     Ok(())
 }

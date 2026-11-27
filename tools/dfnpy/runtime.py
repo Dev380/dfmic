@@ -59,14 +59,12 @@ class Graph:
         self.history: dict[str, collections.deque] = {
             name: collections.deque(maxlen=self.frames) for name in self.input_names
         }
-        # States are indexed by absolute frame number: `state_at[f]` is the
-        # hidden state after frame f (-1 meaning "before the first frame").
-        # Per-frame hidden states, keyed by absolute frame index. Entries before
-        # frame 0 are zeros: the stream starts from silence.
+        # Per-frame hidden states, keyed by absolute frame index: `state_at[f]` is
+        # the hidden state after frame f. Entries before frame 0 are zeros: the
+        # stream starts from silence.
         self.state_at: dict[str, dict[int, np.ndarray]] = {
             s["in"]: {-1: np.zeros(s["shape"][1:], np.float32)} for s in self.spec["states"]
         }
-        self.state_frames = self.frames - 1  # h history length per GRU
         self.next_frame = 0
 
     def prime(self, **frame: np.ndarray) -> None:
@@ -81,13 +79,16 @@ class Graph:
             for _ in range(self.frames):
                 self.history[name].append(np.ascontiguousarray(value, np.float32))
 
-    def push(self, **frame: np.ndarray) -> dict[str, np.ndarray] | None:
-        """Feed one frame; returns that frame's outputs.
+    def push(self, **frame: np.ndarray) -> dict[str, np.ndarray]:
+        """Feed one frame; returns that frame's outputs, always.
 
         The window is left-padded with zeros while it fills up. For a live stream
         that padding is the truth (there is no audio before the first frame), so
         the graph runs from the very first frame and its GRU state is primed with
-        real data instead of being left at zero until the window fills.
+        real data instead of being left at zero until the window fills. There is
+        therefore no warming-up state to report: the caller discards the first
+        frames itself if it wants a settled stream (`--settle` in
+        verify_convert.py).
         """
         for name, value in frame.items():
             self.history[name].append(np.ascontiguousarray(value, np.float32))
@@ -154,19 +155,18 @@ class Runtime:
         for graph in self.graphs.values():
             graph.reset()
 
-    def push(self, feat_erb: np.ndarray, feat_spec: np.ndarray):
+    def push(self, feat_erb: np.ndarray, feat_spec: np.ndarray) -> dict[str, np.ndarray]:
         """Push one frame of features through the encoder.
 
-        Returns the encoder outputs for the whole window, or None while warming
-        up. Only the last frame of the window is valid.
+        Returns the encoder outputs for the whole window. Only the last frame of
+        the window is valid.
         """
         return self.graphs["enc"].push(feat_erb=feat_erb, feat_spec=feat_spec)
 
-    def push_decoders(self, enc: dict[str, np.ndarray]):
+    def push_decoders(self, enc: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         """Feed the encoder's current-frame outputs to both decoders.
 
-        Returns {name: tensor} for the current frame once both decoders have
-        enough history, else None.
+        Returns {name: tensor} for the current frame.
         """
         dec_in = {
             k: np.take(enc[k], [-1], axis=self._axis(k))
@@ -176,8 +176,6 @@ class Runtime:
             emb=dec_in["emb"], e0=dec_in["e0"], e1=dec_in["e1"], e2=dec_in["e2"], e3=dec_in["e3"]
         )
         coefs = self.graphs["df_dec"].push(emb=dec_in["emb"], c0=dec_in["c0"])
-        if m is None or coefs is None:
-            return None
         return {"m": m["m"], "coefs": coefs["coefs"], "lsnr": enc["lsnr"]}
 
     @staticmethod

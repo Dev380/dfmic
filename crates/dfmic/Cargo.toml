@@ -35,4 +35,8 @@ slint-build = { version = "1.19", optional = true }
 [features]
 # Slint and its windowing stack are only needed for the GUI; the daemon and the
 # offline path must build without them (and do, on a headless machine).
+#
+# This feature is the highest MSRV in the workspace: Slint 1.19 declares
+# rust-version 1.95, against 1.89 for the default (daemon/CLI) build. Keep the
+# workspace `rust-version` at the default build's floor and this note current.
 gui = ["dep:slint", "dep:slint-build"]
